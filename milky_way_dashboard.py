@@ -48,8 +48,12 @@ df = df[df["parallax"] > 0]
 coords = SkyCoord(
     l=df["l"].values * u.deg,
     b=df["b"].values * u.deg,
-    distance=Distance(parallax=df["parallax"].values * u.mas)
+    distance=Distance(
+        parallax=df["parallax"].values * u.mas,
+        allow_negative=True
+    )
 )
+
 
 df["x"] = coords.cartesian.x.value
 df["y"] = coords.cartesian.y.value
