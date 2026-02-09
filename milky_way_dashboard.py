@@ -1,143 +1,156 @@
+# milky_way_dashboard.py
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
+import plotly.graph_objects as go
+from astropy.coordinates import SkyCoord
+from astropy import units as u
 
+# ---------------- PAGE SETUP ----------------
 st.set_page_config(
-    page_title="Milky Way 3D",
+    page_title="Map of the Universe",
     layout="wide",
 )
 
-st.title("🌌 Milky Way Galaxy Visualization")
-st.caption("Gaia-inspired perceptual rendering of the Milky Way")
-
-# --------------------------------------------------
-# Load data
-# --------------------------------------------------
-@st.cache_data
-def load_data():
-    df = pd.read_csv("gaia_sample.csv")  # must include x,y,z or ra/dec/parallax
-    return df
-
-df = load_data()
-
-# --------------------------------------------------
-# Coordinate prep (if needed)
-# --------------------------------------------------
-# Assume x,y,z already in parsecs
-df["r"] = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2)
-
-# --------------------------------------------------
-# Spiral disk emphasis
-# --------------------------------------------------
-disk_scale = 300  # thickness of galactic disk (pc)
-df["disk_weight"] = np.exp(-(df["z"]**2) / (2 * disk_scale**2))
-df["alpha"] = 0.15 + 0.85 * df["disk_weight"]
-
-# Star size scaling
-df["size"] = np.clip(6 / (df["r"] + 50), 0.3, 4)
-
-# --------------------------------------------------
-# Camera controls
-# --------------------------------------------------
-st.sidebar.header("Camera")
-cam_x = st.sidebar.slider("Camera X", -2.5, 2.5, 1.6)
-cam_y = st.sidebar.slider("Camera Y", -2.5, 2.5, 1.6)
-cam_z = st.sidebar.slider("Camera Z", -2.5, 2.5, 1.2)
-
-camera_eye = dict(x=cam_x, y=cam_y, z=cam_z)
-
-# --------------------------------------------------
-# Main star field
-# --------------------------------------------------
-fig = px.scatter_3d(
-    df,
-    x="x",
-    y="y",
-    z="z",
-    color="r",
-    color_continuous_scale="Inferno",
-    size="size",
-    opacity=0.25
+st.markdown(
+    """
+    <style>
+    body { background-color: black; }
+    </style>
+    """,
+    unsafe_allow_html=True
 )
 
-# --------------------------------------------------
-# Glow layer (soft halo)
-# --------------------------------------------------
-fig.add_scatter3d(
-    x=df["x"],
-    y=df["y"],
-    z=df["z"],
-    mode="markers",
-    marker=dict(
-        size=df["size"] * 3,
-        color="white",
-        opacity=0.05
-    ),
-    showlegend=False
+st.title("🌌 Map of the Universe")
+
+# ---------------- SCALE SELECTOR ----------------
+scale = st.selectbox(
+    "Choose scale",
+    [
+        "Solar Neighborhood",
+        "Milky Way (Spiral View)",
+    ]
 )
 
-# --------------------------------------------------
-# Density fog (interstellar haze)
-# --------------------------------------------------
-fog = df.sample(min(3000, len(df)))
+# ---------------- LOAD DATA ----------------
+df = pd.read_csv("gaia_sample.csv")
 
-fig.add_scatter3d(
-    x=fog["x"],
-    y=fog["y"],
-    z=fog["z"],
-    mode="markers",
-    marker=dict(
-        size=8,
-        color="white",
-        opacity=0.02
-    ),
-    showlegend=False
+required_cols = ["parallax", "l", "b"]
+for c in required_cols:
+    if c not in df.columns:
+        st.error(f"Missing column: {c}")
+        st.stop()
+
+df = df.dropna(subset=required_cols)
+df = df[df["parallax"] > 0]
+
+# ---------------- DISTANCE + COORDINATES ----------------
+df["distance_pc"] = 1000 / df["parallax"]
+
+coords = SkyCoord(
+    l=df["l"].values * u.deg,
+    b=df["b"].values * u.deg,
+    distance=df["distance_pc"].values * u.pc,
+    frame="galactic",
 )
 
-# --------------------------------------------------
-# Layout polish
-# --------------------------------------------------
+df["x"] = coords.cartesian.x.value
+df["y"] = coords.cartesian.y.value
+df["z"] = coords.cartesian.z.value
+df["r"] = np.sqrt(df["x"]**2 + df["y"]**2)
+
+# ---------------- SPIRAL ARM SHAPING ----------------
+theta = np.arctan2(df["y"], df["x"])
+spiral_offset = np.sin(4 * theta + df["r"] / 1500)
+df["spiral_weight"] = np.exp(-df["z"]**2 / 200**2) * (1 + 0.6 * spiral_offset)
+
+# ---------------- MAIN GALAXY VIEW ----------------
+fig = go.Figure()
+
+fig.add_trace(
+    go.Scatter3d(
+        x=df["x"],
+        y=df["y"],
+        z=df["z"],
+        mode="markers",
+        marker=dict(
+            size=1.6,
+            color=df["r"],
+            colorscale="Inferno",
+            opacity=0.65,
+        ),
+        name="Stars",
+    )
+)
+
+# ---------------- FOG / DENSITY GLOW ----------------
+fog = df.sample(min(4000, len(df)))
+
+fig.add_trace(
+    go.Scatter3d(
+        x=fog["x"],
+        y=fog["y"],
+        z=fog["z"],
+        mode="markers",
+        marker=dict(
+            size=4,
+            color="white",
+            opacity=0.03,
+        ),
+        showlegend=False,
+    )
+)
+
 fig.update_layout(
     scene=dict(
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        zaxis=dict(visible=False),
+        xaxis_visible=False,
+        yaxis_visible=False,
+        zaxis_visible=False,
         bgcolor="black",
-        aspectmode="data",
-        camera=dict(eye=camera_eye)
+        camera=dict(
+            eye=dict(x=1.4, y=1.4, z=0.6)
+        ),
     ),
     paper_bgcolor="black",
     plot_bgcolor="black",
     margin=dict(l=0, r=0, t=0, b=0),
-    coloraxis_showscale=False
 )
-
-fig.update_traces(marker=dict(line=dict(width=0)))
 
 st.plotly_chart(fig, use_container_width=True)
 
-# --------------------------------------------------
-# Mini-map overview
-# --------------------------------------------------
-with st.expander("🛰️ Galaxy Overview (Top-Down)"):
-    top_fig = px.scatter(
-        df,
-        x="x",
-        y="y",
-        color="r",
-        color_continuous_scale="Inferno",
-        opacity=0.3
-    )
+# ---------------- MINI MAP (TOP-DOWN) ----------------
+st.subheader("🗺️ Galaxy Overview (Top-Down)")
 
-    top_fig.update_layout(
-        height=300,
-        paper_bgcolor="black",
-        plot_bgcolor="black",
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        margin=dict(l=0, r=0, t=0, b=0),
-        coloraxis_showscale=False
-    )
+mini = go.Figure()
 
-    st.plotly_chart(top_fig, use_container_width=True)
+mini.add_trace(
+    go.Scattergl(
+        x=df["x"],
+        y=df["y"],
+        mode="markers",
+        marker=dict(
+            size=1,
+            color=df["r"],
+            colorscale="Inferno",
+            opacity=0.5,
+        ),
+    )
+)
+
+mini.update_layout(
+    xaxis_visible=False,
+    yaxis_visible=False,
+    paper_bgcolor="black",
+    plot_bgcolor="black",
+    height=300,
+    margin=dict(l=0, r=0, t=0, b=0),
+)
+
+st.plotly_chart(mini, use_container_width=True)
+
+# ---------------- FOOTER ----------------
+st.markdown(
+    "<center style='color:gray'>Gaia data • Cinematic galaxy rendering</center>",
+    unsafe_allow_html=True,
+)
