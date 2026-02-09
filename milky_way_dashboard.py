@@ -4,22 +4,13 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import Distance
 from astropy import units as u
 
-# ---------------- PAGE SETUP ----------------
+# ---------------- PAGE CONFIG ----------------
 st.set_page_config(
     page_title="Map of the Universe",
-    layout="wide",
-)
-
-st.markdown(
-    """
-    <style>
-    body { background-color: black; }
-    </style>
-    """,
-    unsafe_allow_html=True
+    layout="wide"
 )
 
 st.title("🌌 Map of the Universe")
@@ -28,129 +19,129 @@ st.title("🌌 Map of the Universe")
 scale = st.selectbox(
     "Choose scale",
     [
+        "Earth Vicinity",
         "Solar Neighborhood",
-        "Milky Way (Spiral View)",
+        "Milky Way",
+        "Local Group",
+        "Observable Universe",
     ]
 )
 
 # ---------------- LOAD DATA ----------------
-df = pd.read_csv("gaia_sample.csv")
+try:
+    df = pd.read_csv("gaia_sample.csv")
+except FileNotFoundError:
+    st.error("gaia_sample.csv not found in repository.")
+    st.stop()
 
 required_cols = ["parallax", "l", "b"]
-for c in required_cols:
-    if c not in df.columns:
-        st.error(f"Missing column: {c}")
+for col in required_cols:
+    if col not in df.columns:
+        st.error(f"Missing column: {col}")
         st.stop()
 
+# ---------------- CLEAN DATA ----------------
 df = df.dropna(subset=required_cols)
 df = df[df["parallax"] > 0]
 
-# ---------------- DISTANCE + COORDINATES ----------------
-df["distance_pc"] = 1000 / df["parallax"]
+# Distance (parsecs)
+df["distance_pc"] = Distance(
+    parallax=df["parallax"].values * u.mas
+).pc
 
-coords = SkyCoord(
-    l=df["l"].values * u.deg,
-    b=df["b"].values * u.deg,
-    distance=df["distance_pc"].values * u.pc,
-    frame="galactic",
-)
+# Convert galactic to cartesian (disk-aligned)
+l_rad = np.deg2rad(df["l"].values)
+b_rad = np.deg2rad(df["b"].values)
+r = df["distance_pc"].values
 
-df["x"] = coords.cartesian.x.value
-df["y"] = coords.cartesian.y.value
-df["z"] = coords.cartesian.z.value
-df["r"] = np.sqrt(df["x"]**2 + df["y"]**2)
+df["x"] = r * np.cos(b_rad) * np.cos(l_rad)
+df["y"] = r * np.cos(b_rad) * np.sin(l_rad)
+df["z"] = r * np.sin(b_rad)
 
-# ---------------- SPIRAL ARM SHAPING ----------------
-theta = np.arctan2(df["y"], df["x"])
-spiral_offset = np.sin(4 * theta + df["r"] / 1500)
-df["spiral_weight"] = np.exp(-df["z"]**2 / 200**2) * (1 + 0.6 * spiral_offset)
+df["radius"] = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2)
 
-# ---------------- MAIN GALAXY VIEW ----------------
+# ---------------- SCALE LOGIC ----------------
+if scale == "Earth Vicinity":
+    view = df[df["radius"] < 50]
+    camera = dict(x=0.3, y=0.3, z=0.2)
+    size = 3.5
+    opacity = 0.95
+
+elif scale == "Solar Neighborhood":
+    view = df[df["radius"] < 500]
+    camera = dict(x=0.7, y=0.7, z=0.4)
+    size = 2.5
+    opacity = 0.8
+
+elif scale == "Milky Way":
+    view = df
+    camera = dict(x=1.6, y=1.6, z=0.6)
+    size = 1.6
+    opacity = 0.6
+
+elif scale == "Local Group":
+    view = df.sample(min(6000, len(df)))
+    camera = dict(x=3, y=3, z=1.4)
+    size = 1.1
+    opacity = 0.35
+
+else:  # Observable Universe
+    view = df.sample(min(3000, len(df)))
+    camera = dict(x=5, y=5, z=2.2)
+    size = 0.9
+    opacity = 0.25
+
+# ---------------- 3D VISUALIZATION ----------------
 fig = go.Figure()
 
+# Star field
 fig.add_trace(
     go.Scatter3d(
-        x=df["x"],
-        y=df["y"],
-        z=df["z"],
+        x=view["x"],
+        y=view["y"],
+        z=view["z"],
         mode="markers",
         marker=dict(
-            size=1.6,
-            color=df["r"],
+            size=size,
+            color=view["radius"],
             colorscale="Inferno",
-            opacity=0.65,
+            opacity=opacity,
         ),
         name="Stars",
     )
 )
 
-# ---------------- FOG / DENSITY GLOW ----------------
-fog = df.sample(min(4000, len(df)))
-
+# Galactic core glow
 fig.add_trace(
     go.Scatter3d(
-        x=fog["x"],
-        y=fog["y"],
-        z=fog["z"],
+        x=[0],
+        y=[0],
+        z=[0],
         mode="markers",
         marker=dict(
-            size=4,
+            size=20,
             color="white",
-            opacity=0.03,
+            opacity=0.9,
         ),
-        showlegend=False,
+        name="Galactic Core",
     )
 )
 
+# ---------------- LAYOUT ----------------
 fig.update_layout(
     scene=dict(
-        xaxis_visible=False,
-        yaxis_visible=False,
-        zaxis_visible=False,
-        bgcolor="black",
-        camera=dict(
-            eye=dict(x=1.4, y=1.4, z=0.6)
-        ),
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        zaxis=dict(visible=False),
+        camera=dict(eye=camera),
+        aspectmode="data",
     ),
+    margin=dict(l=0, r=0, b=0, t=40),
     paper_bgcolor="black",
     plot_bgcolor="black",
-    margin=dict(l=0, r=0, t=0, b=0),
+    showlegend=False,
 )
 
 st.plotly_chart(fig, use_container_width=True)
 
-# ---------------- MINI MAP (TOP-DOWN) ----------------
-st.subheader("🗺️ Galaxy Overview (Top-Down)")
-
-mini = go.Figure()
-
-mini.add_trace(
-    go.Scattergl(
-        x=df["x"],
-        y=df["y"],
-        mode="markers",
-        marker=dict(
-            size=1,
-            color=df["r"],
-            colorscale="Inferno",
-            opacity=0.5,
-        ),
-    )
-)
-
-mini.update_layout(
-    xaxis_visible=False,
-    yaxis_visible=False,
-    paper_bgcolor="black",
-    plot_bgcolor="black",
-    height=300,
-    margin=dict(l=0, r=0, t=0, b=0),
-)
-
-st.plotly_chart(mini, use_container_width=True)
-
-# ---------------- FOOTER ----------------
-st.markdown(
-    "<center style='color:gray'>Gaia data • Cinematic galaxy rendering</center>",
-    unsafe_allow_html=True,
-)
+st.caption(f"Scale: {scale} • Stars shown: {len(view)}")
