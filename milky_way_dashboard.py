@@ -1,138 +1,143 @@
-# milky_way_dashboard.py
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from astropy.coordinates import SkyCoord, Distance
-import astropy.units as u
 
-# MUST BE FIRST
 st.set_page_config(
-    page_title="Map of the Universe",
+    page_title="Milky Way 3D",
     layout="wide",
-    page_icon="🌌"
 )
 
-st.title("Map of the Universe")
+st.title("🌌 Milky Way Galaxy Visualization")
+st.caption("Gaia-inspired perceptual rendering of the Milky Way")
 
-# ----------------------
-# SCALE SELECTOR
-# ----------------------
-scale = st.selectbox(
-    "Choose scale",
-    [
-        "Earth vicinity",
-        "Solar neighborhood",
-        "Milky Way",
-        "Local Group",
-        "Observable Universe"
-    ]
-)
+# --------------------------------------------------
+# Load data
+# --------------------------------------------------
+@st.cache_data
+def load_data():
+    df = pd.read_csv("gaia_sample.csv")  # must include x,y,z or ra/dec/parallax
+    return df
 
-# ----------------------
-# LOAD DATA
-# ----------------------
-try:
-    df = pd.read_csv("gaia_sample.csv")
-except FileNotFoundError:
-    st.error("gaia_sample.csv not found in repo")
-    st.stop()
+df = load_data()
 
-required_cols = ["parallax", "l", "b"]
-df = df.dropna(subset=required_cols)
-df = df[df["parallax"] > 0]
+# --------------------------------------------------
+# Coordinate prep (if needed)
+# --------------------------------------------------
+# Assume x,y,z already in parsecs
+df["r"] = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2)
 
-# ----------------------
-# CONVERT TO REAL 3D SPACE
-# ----------------------
-coords = SkyCoord(
-    l=df["l"].values * u.deg,
-    b=df["b"].values * u.deg,
-    distance=Distance(
-        parallax=df["parallax"].values * u.mas,
-        allow_negative=True
-    ),
-    frame="galactic"
-)
+# --------------------------------------------------
+# Spiral disk emphasis
+# --------------------------------------------------
+disk_scale = 300  # thickness of galactic disk (pc)
+df["disk_weight"] = np.exp(-(df["z"]**2) / (2 * disk_scale**2))
+df["alpha"] = 0.15 + 0.85 * df["disk_weight"]
 
+# Star size scaling
+df["size"] = np.clip(6 / (df["r"] + 50), 0.3, 4)
 
-df["x"] = coords.cartesian.x.value
-df["y"] = coords.cartesian.y.value
-df["z"] = coords.cartesian.z.value
-df["r"] = np.sqrt(df.x**2 + df.y**2 + df.z**2)
+# --------------------------------------------------
+# Camera controls
+# --------------------------------------------------
+st.sidebar.header("Camera")
+cam_x = st.sidebar.slider("Camera X", -2.5, 2.5, 1.6)
+cam_y = st.sidebar.slider("Camera Y", -2.5, 2.5, 1.6)
+cam_z = st.sidebar.slider("Camera Z", -2.5, 2.5, 1.2)
 
-# ----------------------
-# SCALE LOGIC
-# ----------------------
-if scale == "Earth vicinity":
-    df = df[df["r"] < 50]
-    camera_eye = dict(x=0.5, y=0.5, z=0.5)
+camera_eye = dict(x=cam_x, y=cam_y, z=cam_z)
 
-elif scale == "Solar neighborhood":
-    df = df[df["r"] < 500]
-    camera_eye = dict(x=1, y=1, z=0.6)
-
-elif scale == "Milky Way":
-    df = df[df["r"] < 5000]
-    camera_eye = dict(x=1.8, y=1.8, z=0.6)
-
-elif scale == "Local Group":
-    camera_eye = dict(x=3, y=3, z=1)
-
-elif scale == "Observable Universe":
-    camera_eye = dict(x=6, y=6, z=2)
-
-# Star appearance
-df["size"] = np.clip(4 / df["r"], 0.3, 3)
-
-# ----------------------
-# 3D STAR FIELD
-# ----------------------
+# --------------------------------------------------
+# Main star field
+# --------------------------------------------------
 fig = px.scatter_3d(
     df,
     x="x",
     y="y",
     z="z",
-    size="size",
     color="r",
     color_continuous_scale="Inferno",
-    opacity=0.6
+    size="size",
+    opacity=0.25
 )
 
-# ----------------------
-# ADD SYNTHETIC GALAXIES (FOR LARGE SCALES)
-# ----------------------
-if scale in ["Local Group", "Observable Universe"]:
-    galaxies = np.random.normal(scale=30000, size=(3000, 3))
-    fig.add_scatter3d(
-        x=galaxies[:, 0],
-        y=galaxies[:, 1],
-        z=galaxies[:, 2],
-        mode="markers",
-        marker=dict(size=1, opacity=0.15, color="white"),
-        name="Galaxies"
-    )
+# --------------------------------------------------
+# Glow layer (soft halo)
+# --------------------------------------------------
+fig.add_scatter3d(
+    x=df["x"],
+    y=df["y"],
+    z=df["z"],
+    mode="markers",
+    marker=dict(
+        size=df["size"] * 3,
+        color="white",
+        opacity=0.05
+    ),
+    showlegend=False
+)
 
-# ----------------------
-# SPACE AESTHETICS
-# ----------------------
+# --------------------------------------------------
+# Density fog (interstellar haze)
+# --------------------------------------------------
+fog = df.sample(min(3000, len(df)))
+
+fig.add_scatter3d(
+    x=fog["x"],
+    y=fog["y"],
+    z=fog["z"],
+    mode="markers",
+    marker=dict(
+        size=8,
+        color="white",
+        opacity=0.02
+    ),
+    showlegend=False
+)
+
+# --------------------------------------------------
+# Layout polish
+# --------------------------------------------------
 fig.update_layout(
     scene=dict(
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
         zaxis=dict(visible=False),
-        bgcolor="black"
+        bgcolor="black",
+        aspectmode="data",
+        camera=dict(eye=camera_eye)
     ),
     paper_bgcolor="black",
     plot_bgcolor="black",
     margin=dict(l=0, r=0, t=0, b=0),
-    scene_camera=dict(eye=camera_eye)
+    coloraxis_showscale=False
 )
 
 fig.update_traces(marker=dict(line=dict(width=0)))
 
-# ----------------------
-# DISPLAY
-# ----------------------
 st.plotly_chart(fig, use_container_width=True)
-st.caption(f"Stars rendered: {len(df):,}")
+
+# --------------------------------------------------
+# Mini-map overview
+# --------------------------------------------------
+with st.expander("🛰️ Galaxy Overview (Top-Down)"):
+    top_fig = px.scatter(
+        df,
+        x="x",
+        y="y",
+        color="r",
+        color_continuous_scale="Inferno",
+        opacity=0.3
+    )
+
+    top_fig.update_layout(
+        height=300,
+        paper_bgcolor="black",
+        plot_bgcolor="black",
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        margin=dict(l=0, r=0, t=0, b=0),
+        coloraxis_showscale=False
+    )
+
+    st.plotly_chart(top_fig, use_container_width=True)
