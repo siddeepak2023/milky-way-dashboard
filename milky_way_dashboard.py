@@ -1,64 +1,133 @@
-import pandas as pd
-import plotly.express as px
-from astropy.coordinates import Distance
-from astropy import units as u
+# milky_way_dashboard.py
 import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from astropy.coordinates import SkyCoord, Distance
+import astropy.units as u
 
-# -----------------------------
-# Title
-# -----------------------------
-st.title("Local Milky Way Star Map (Gaia Data) 🌌")
-st.markdown("""
-This dashboard shows local stars from Gaia data.
-You can filter stars by distance and interactively explore their positions.
-""")
+# MUST BE FIRST
+st.set_page_config(
+    page_title="Map of the Universe",
+    layout="wide",
+    page_icon="🌌"
+)
 
-# -----------------------------
-# Load data
-# -----------------------------
-@st.cache_data
-def load_data():
+st.title("Map of the Universe")
+
+# ----------------------
+# SCALE SELECTOR
+# ----------------------
+scale = st.selectbox(
+    "Choose scale",
+    [
+        "Earth vicinity",
+        "Solar neighborhood",
+        "Milky Way",
+        "Local Group",
+        "Observable Universe"
+    ]
+)
+
+# ----------------------
+# LOAD DATA
+# ----------------------
+try:
     df = pd.read_csv("gaia_sample.csv")
-    required_cols = ["l", "b", "parallax"]
-    df = df.dropna(subset=required_cols)
-    df["distance_pc"] = Distance(parallax=df["parallax"].values * u.mas, allow_negative=True).pc
-    df = df.dropna(subset=["distance_pc"])
-    return df
+except FileNotFoundError:
+    st.error("gaia_sample.csv not found in repo")
+    st.stop()
 
-df = load_data()
+required_cols = ["parallax", "l", "b"]
+df = df.dropna(subset=required_cols)
+df = df[df["parallax"] > 0]
 
-# -----------------------------
-# Sidebar controls
-# -----------------------------
-max_distance = int(df["distance_pc"].max())
-distance_filter = st.sidebar.slider(
-    "Maximum distance (parsecs)",
-    min_value=0,
-    max_value=max_distance,
-    value=5000,
-    step=100
+# ----------------------
+# CONVERT TO REAL 3D SPACE
+# ----------------------
+coords = SkyCoord(
+    l=df["l"].values * u.deg,
+    b=df["b"].values * u.deg,
+    distance=Distance(parallax=df["parallax"].values * u.mas)
 )
 
-filtered_df = df[df["distance_pc"] <= distance_filter]
+df["x"] = coords.cartesian.x.value
+df["y"] = coords.cartesian.y.value
+df["z"] = coords.cartesian.z.value
+df["r"] = np.sqrt(df.x**2 + df.y**2 + df.z**2)
 
-st.sidebar.markdown(f"Displaying {len(filtered_df)} stars out of {len(df)} total")
+# ----------------------
+# SCALE LOGIC
+# ----------------------
+if scale == "Earth vicinity":
+    df = df[df["r"] < 50]
+    camera_eye = dict(x=0.5, y=0.5, z=0.5)
 
-# -----------------------------
-# Plot
-# -----------------------------
-fig = px.scatter(
-    filtered_df,
-    x="l",
-    y="b",
-    color="distance_pc",
-    labels={
-        "l": "Galactic Longitude (deg)",
-        "b": "Galactic Latitude (deg)",
-        "distance_pc": "Distance (pc)"
-    },
-    title=f"Stars within {distance_filter} parsecs",
-    opacity=0.6,
-    hover_data={"distance_pc": True},
+elif scale == "Solar neighborhood":
+    df = df[df["r"] < 500]
+    camera_eye = dict(x=1, y=1, z=0.6)
+
+elif scale == "Milky Way":
+    df = df[df["r"] < 5000]
+    camera_eye = dict(x=1.8, y=1.8, z=0.6)
+
+elif scale == "Local Group":
+    camera_eye = dict(x=3, y=3, z=1)
+
+elif scale == "Observable Universe":
+    camera_eye = dict(x=6, y=6, z=2)
+
+# Star appearance
+df["size"] = np.clip(4 / df["r"], 0.3, 3)
+
+# ----------------------
+# 3D STAR FIELD
+# ----------------------
+fig = px.scatter_3d(
+    df,
+    x="x",
+    y="y",
+    z="z",
+    size="size",
+    color="r",
+    color_continuous_scale="Inferno",
+    opacity=0.6
 )
 
+# ----------------------
+# ADD SYNTHETIC GALAXIES (FOR LARGE SCALES)
+# ----------------------
+if scale in ["Local Group", "Observable Universe"]:
+    galaxies = np.random.normal(scale=30000, size=(3000, 3))
+    fig.add_scatter3d(
+        x=galaxies[:, 0],
+        y=galaxies[:, 1],
+        z=galaxies[:, 2],
+        mode="markers",
+        marker=dict(size=1, opacity=0.15, color="white"),
+        name="Galaxies"
+    )
+
+# ----------------------
+# SPACE AESTHETICS
+# ----------------------
+fig.update_layout(
+    scene=dict(
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        zaxis=dict(visible=False),
+        bgcolor="black"
+    ),
+    paper_bgcolor="black",
+    plot_bgcolor="black",
+    margin=dict(l=0, r=0, t=0, b=0),
+    scene_camera=dict(eye=camera_eye)
+)
+
+fig.update_traces(marker=dict(line=dict(width=0)))
+
+# ----------------------
+# DISPLAY
+# ----------------------
 st.plotly_chart(fig, use_container_width=True)
+st.caption(f"Stars rendered: {len(df):,}")
