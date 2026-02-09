@@ -51,7 +51,8 @@ coords = SkyCoord(
     distance=Distance(
         parallax=df["parallax"].values * u.mas,
         allow_negative=True
-    )
+    ),
+    frame="galactic"
 )
 
 
