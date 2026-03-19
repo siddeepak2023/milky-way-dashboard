@@ -1,8 +1,8 @@
 streamlit
 pandas
+numpy
 plotly
 astropy
-altair==4.2.2
-
-
-
+requests
+tqdm
+scipy
