@@ -1,0 +1,4 @@
+[[redirects]]
+  from = "/"
+  to = "/universe_viewer.html"
+  status = 200
