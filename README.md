@@ -7,19 +7,40 @@ A real-time interactive 3D visualisation of the observable universe, built entir
 
 ## What you're looking at
 
-| Layer | Source | Count |
+| Layer | Source | Count shipped |
 |---|---|---|
-| Stars | Gaia DR3 (ESA) | up to 500,000 |
-| Galaxies | 2MRS / HyperLEDA | ~43,000 |
-| Exoplanets | NASA Exoplanet Archive | ~14,000 systems |
-| Quasars | SDSS DR17 spectroscopic | up to 300,000 |
-| Filaments | Tempel et al. 2014 (Bisous SDSS) | ~15,000 segments |
+| Stars | Gaia DR3 (ESA) | 500,000 |
+| Galaxies | 2MRS / HyperLEDA | 43,507 |
+| Quasars | SDSS DR17 spectroscopic | 300,000 |
+| Exoplanets | NASA Exoplanet Archive | 6,411 |
 
-**Colour gradient** maps distance and cosmic epoch:
-- **Gold/amber** → nearby galaxy clusters
-- **Hot pink** → mid-distance cosmic web
-- **Teal/cyan** → sparse outer edges
-- **Ice blue** → quasars (most ancient light, z up to 6)
+849,918 points total. The pipeline can also fetch Tempel et al. 2014 (Bisous SDSS)
+filaments, but **the viewer does not render them yet** — see the plan.
+
+### What the colours mean
+
+- **Stars** are coloured by their **real measured Gaia `BP−RP` colour index**, converted
+  to an effective temperature (Ballesteros 2012) and then to a blackbody colour along the
+  Planck locus. Cool M-dwarfs come out deep amber, Sun-like stars cream, hot stars blue-white.
+  497,163 of the 500,000 have a measured `BP−RP`; the remaining 2,837 render neutral rather
+  than being assigned an invented colour.
+- **Galaxies, quasars and exoplanets** currently use **one flat colour per layer** — layer
+  identity only, encoding nothing per object. Their `redshift` is fetched by the pipeline but
+  not yet packed into the binaries; once it is, they get a real epoch ramp.
+- **Brightness** follows each object's packed radius/magnitude proxy. **Per-layer exposure**
+  is a display setting, not data: 500,000 additively-blended stars need less energy each than
+  6,411 exoplanets do.
+
+Earlier versions of this README described a colour gradient mapping "distance and cosmic
+epoch". That was not true — colour was derived from a hash of the array index. It is real now
+for stars, and honestly flat for the rest.
+
+### On the layout
+
+Each layer is recentred on its own centroid and rescaled so its 98th-percentile radius maps to
+a fixed shell (`normalizeLayer`). That makes the layers legible together, but it means
+**relative distances between layers are presentational, not physical**. This is a stylised
+atlas of shells, not a metric map of the universe.
 
 ---
 

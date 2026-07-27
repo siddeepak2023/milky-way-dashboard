@@ -125,6 +125,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 
 const lb=document.getElementById('lb'), lm=document.getElementById('lm');
 const setProg=(p,m)=>{lb.style.width=(p*100).toFixed(0)+'%';if(m)lm.textContent=m;};
@@ -133,6 +134,11 @@ const setProg=(p,m)=>{lb.style.width=(p*100).toFixed(0)+'%';if(m)lm.textContent=
 const renderer=new THREE.WebGLRenderer({canvas:document.getElementById('c'),antialias:true,alpha:true});
 renderer.setPixelRatio(Math.min(devicePixelRatio,2));
 renderer.setSize(innerWidth,innerHeight);
+// Filmic roll-off instead of hard clipping to white: bright cores keep their
+// colour instead of blowing out, which is what made the field read as flat.
+// Applied by OutputPass at the end of the composer chain.
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.0;
 const scene=new THREE.Scene();
 scene.fog=new THREE.FogExp2(0x04060d,0.0); // depth handled in shader; keep subtle
 
@@ -145,10 +151,15 @@ controls.rotateSpeed=0.5; controls.zoomSpeed=0.8; controls.panSpeed=0.6;
 controls.minDistance=2; controls.maxDistance=4000;
 
 // bloom
+// Selective bloom: half-resolution and a high threshold, so only genuinely bright
+// objects flare and faint stars stay pinpoints. The old full-res 0.22 threshold
+// bloomed the entire 850k-point field into haze — which is why the star colours
+// had to be hand-dimmed to stop it becoming a blob.
 const composer=new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene,camera));
-const bloom=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.55,0.6,0.22);
+const bloom=new UnrealBloomPass(new THREE.Vector2(innerWidth/2,innerHeight/2),0.85,0.75,0.78);
 composer.addPass(bloom);
+composer.addPass(new OutputPass());
 
 // ── point shader (soft glowing sprite, depth-attenuated) ───────────────
 const vert=`
@@ -167,24 +178,29 @@ const vert=`
 const frag=`
   precision mediump float;
   varying float vB; varying vec3 vC;
+  uniform float uExposure;   // per-layer exposure. Additive blending accumulates,
+                             // so a dense layer needs less per-point energy. This
+                             // is exposure, NOT a change to the measured colour.
   void main(){
     vec2 p=gl_PointCoord-0.5;
     float r=length(p);
     if(r>0.5) discard;
     float core=smoothstep(0.5,0.0,r);
     float glow=pow(core,1.8);
-    float a=glow*(0.35+vB*0.65);
-    vec3 col=vC*(0.55+vB*0.9) + vec3(1.0)*pow(core,9.0)*0.28; // tight subtle core
+    float a=glow*(0.35+vB*0.65)*uExposure;
+    // Core highlight is tinted by the star's own colour rather than pure white —
+    // a white add on every point is what averaged 500k real colours into grey.
+    vec3 col=vC*(0.55+vB*0.9) + mix(vC,vec3(1.0),0.30)*pow(core,9.0)*0.16;
     gl_FragColor=vec4(col,a);
   }`;
 
-function makeLayer(pos,col,bright,sizeMul){
+function makeLayer(pos,col,bright,sizeMul,exposure){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position',new THREE.BufferAttribute(pos,3));
   g.setAttribute('aColor',new THREE.BufferAttribute(col,3));
   g.setAttribute('aBright',new THREE.BufferAttribute(bright,1));
   const m=new THREE.ShaderMaterial({
-    uniforms:{uSize:{value:1.0*sizeMul},uScale:{value:260.0}},
+    uniforms:{uSize:{value:1.0*sizeMul},uScale:{value:260.0},uExposure:{value:exposure??1.0}},
     vertexShader:vert,fragmentShader:frag,
     transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
   });
@@ -193,8 +209,11 @@ function makeLayer(pos,col,bright,sizeMul){
 }
 
 // ── binary load → typed arrays ─────────────────────────────────────────
-// .bin = packed Float32 [x,y,z,r] per point. Zero text parsing → instant load,
-// streamed with progress. Falls back to nothing if a file is missing.
+// v2 .bin: header "CSMS" + uint32 version/count/stride, then Float32
+// [x,y,z,size,value] per point. `value` is that layer's real measured scalar
+// (bp_rp for stars, redshift for galaxies/quasars) — NaN where unmeasured.
+// v1 files (bare Float32 [x,y,z,r]) still load; their value comes back NaN so
+// colour falls back to neutral instead of being invented.
 async function loadBin(url,onP){
   const res=await fetch(url);
   const total=+res.headers.get('content-length')||0;
@@ -203,11 +222,27 @@ async function loadBin(url,onP){
   while(true){ const {done,value}=await reader.read(); if(done) break; chunks.push(value); got+=value.length; if(onP&&total) onP(got/total); }
   let len=0; for(const c of chunks) len+=c.length;
   const bytes=new Uint8Array(len); let off=0; for(const c of chunks){ bytes.set(c,off); off+=c.length; }
-  const f=new Float32Array(bytes.buffer, 0, (len/4)|0);
-  const n=(f.length/4)|0;
-  const pos=new Float32Array(n*3), rad=new Float32Array(n);
-  for(let i=0;i<n;i++){ pos[i*3]=f[i*4]; pos[i*3+1]=f[i*4+1]; pos[i*3+2]=f[i*4+2]; rad[i]=f[i*4+3]; }
-  return {pos,rad,n};
+
+  const hasHdr = len>16 && bytes[0]===0x43 && bytes[1]===0x53 && bytes[2]===0x4d && bytes[3]===0x53; // "CSMS"
+  let stride=4, n=0, f;
+  if(hasHdr){
+    const h=new DataView(bytes.buffer,4,12);
+    const version=h.getUint32(0,true); n=h.getUint32(4,true); stride=h.getUint32(8,true);
+    if(version!==2) console.warn(url+': unknown version '+version+', reading as stride '+stride);
+    f=new Float32Array(bytes.buffer, 16, n*stride);
+  }else{
+    f=new Float32Array(bytes.buffer, 0, (len/4)|0);
+    n=(f.length/4)|0;
+  }
+
+  const pos=new Float32Array(n*3), rad=new Float32Array(n), val=new Float32Array(n);
+  for(let i=0;i<n;i++){
+    const o=i*stride;
+    pos[i*3]=f[o]; pos[i*3+1]=f[o+1]; pos[i*3+2]=f[o+2];
+    rad[i]=f[o+3];
+    val[i]= stride>=5 ? f[o+4] : NaN;
+  }
+  return {pos,rad,val,n};
 }
 
 // Each dataset lives in its own physical coordinate frame & scale (Gaia stars
@@ -227,25 +262,52 @@ function normalizeLayer(pos,n,target){
   for(let i=0;i<n;i++){ pos[i*3]=(pos[i*3]-cx)*s; pos[i*3+1]=(pos[i*3+1]-cy)*s; pos[i*3+2]=(pos[i*3+2]-cz)*s; }
 }
 
-function colorize(n,rad,kind){
+// Ballesteros (2012) colour-index → effective temperature. Derived for B−V;
+// Gaia's BP−RP tracks it closely enough for colour, not for astrophysics.
+function teffFromBpRp(bp_rp){
+  const c=0.92*bp_rp;
+  return 4600*(1/(c+1.7) + 1/(c+0.62));
+}
+// Planck locus → linear RGB (Tanner Helland's fit). Renderer tone-maps after.
+function blackbodyRGB(K){
+  const t=Math.min(40000,Math.max(1000,K))/100;
+  let R,G,B;
+  if(t<=66){ R=255; G=99.4708025861*Math.log(t)-161.1195681661; }
+  else { R=329.698727446*Math.pow(t-60,-0.1332047592); G=288.1221695283*Math.pow(t-60,-0.0755148492); }
+  if(t>=66) B=255;
+  else if(t<=19) B=0;
+  else B=138.5177312231*Math.log(t-10)-305.0447927307;
+  const cl=v=>Math.min(1,Math.max(0,v/255));
+  let r=cl(R),g=cl(G),b=cl(B);
+  // Modest saturation boost: additive blending and ACES both pull toward white,
+  // so the true hue needs headroom to survive to the screen. Hue is unchanged.
+  const lum=0.2126*r+0.7152*g+0.0722*b, S=1.35;
+  r=Math.min(1,lum+(r-lum)*S); g=Math.min(1,lum+(g-lum)*S); b=Math.min(1,lum+(b-lum)*S);
+  return [r,g,b];
+}
+
+// Colour comes from measured values only. `val` carries the layer's real scalar
+// (bp_rp for stars); NaN means unmeasured and gets a neutral colour rather than
+// an invented one. Brightness derives from the packed size/radius, also real.
+function colorize(n,rad,val,kind){
   const c=new Float32Array(n*3), b=new Float32Array(n);
-  // normalize radii to brightness
   let mx=0; for(let i=0;i<n;i++) if(rad[i]>mx) mx=rad[i]; if(mx<=0)mx=1;
+  const NEUTRAL=[1.0,0.94,0.86];                 // unmeasured: warm white, no claim
+  const FLAT={galaxies:[0.86,0.55,1.0], quasars:[1.0,0.42,0.82], exo:[0.0,0.86,0.71]};
   for(let i=0;i<n;i++){
     let br=Math.min(1, Math.pow((rad[i]||0.4)/mx,0.5)+0.12);
-    let R,G,B;
-    if(kind==='stars'){ // stellar temperature: warm gold → white → cool blue
-      br*=0.62;                                                           // dim the dense star field (no bloom blob)
-      const t=(Math.sin(i*12.9898)*43758.5453)%1; const tt=t<0?t+1:t;
-      if(tt<0.5){const u=tt/0.5; R=1.0; G=0.63+0.37*u; B=0.31+0.69*u;}    // gold→white
-      else{const u=(tt-0.5)/0.5; R=1.0-0.69*u; G=1.0-0.22*u; B=1.0;}      // white→blue
-    } else if(kind==='galaxies'){ // nebula: rose → violet
-      const u=(Math.sin(i*78.233)*43758.5453)%1; const uu=u<0?u+1:u;
-      R=1.0-0.45*uu; G=0.31+0.0*uu; B=0.63+0.37*uu;                       // (255,80,160)→(140,80,255)
-    } else if(kind==='quasars'){ R=1.0; G=0.31+0.25*br; B=0.78; }        // hot magenta
-    else { R=0.0; G=0.86+0.0*br; B=0.71; }                                // exo teal-cyan (0,220,180)
+    let rgb;
+    if(kind==='stars'){
+      const v=val?val[i]:NaN;
+      rgb = Number.isFinite(v) ? blackbodyRGB(teffFromBpRp(v)) : NEUTRAL;
+    }else{
+      // No measured scalar packed for these layers yet, so one honest colour per
+      // layer — identity, not fabricated per-object variation. Swap to a redshift
+      // ramp once to_bin.py packs it.
+      rgb = FLAT[kind] || NEUTRAL;
+    }
     b[i]=br;
-    c[i*3]=R;c[i*3+1]=G;c[i*3+2]=B;
+    c[i*3]=rgb[0]; c[i*3+1]=rgb[1]; c[i*3+2]=rgb[2];
   }
   return {col:c,bright:b};
 }
@@ -256,23 +318,25 @@ function fmt(n){return n.toLocaleString();}
 
 async function boot(){
   // norm = target shell radius (concentric: exo inner → quasars outer)
+  // exp = per-layer exposure. 500k stars pile up additively in a small volume, so
+  // they need far less energy each than the 6k exoplanets do.
   const files=[
-    {k:'stars',    url:'stars.bin',    size:1.0, norm:70,   p:[0,0.55]},
-    {k:'quasars',  url:'quasars.bin',  size:1.25,norm:1000, p:[0.55,0.82]},
-    {k:'galaxies', url:'galaxies.bin', size:1.7, norm:320,  p:[0.82,0.94]},
-    {k:'exo',      url:'exo.bin',      size:2.2, norm:14,   p:[0.94,1.0]},
+    {k:'stars',    url:'stars.bin',    size:1.0, norm:70,   exp:0.16, p:[0,0.55]},
+    {k:'quasars',  url:'quasars.bin',  size:1.25,norm:1000, exp:0.55, p:[0.55,0.82]},
+    {k:'galaxies', url:'galaxies.bin', size:1.7, norm:320,  exp:0.85, p:[0.82,0.94]},
+    {k:'exo',      url:'exo.bin',      size:2.2, norm:14,   exp:0.30, p:[0.94,1.0]},
   ];
   let totalN=0;
   for(const f of files){
     setProg(f.p[0], 'Loading '+f.k+'…');
     let d;
     try{ d=await loadBin(f.url, (fp)=>setProg(f.p[0]+(f.p[1]-f.p[0])*fp)); }
-    catch(e){ d={pos:new Float32Array(0),rad:new Float32Array(0),n:0}; }
+    catch(e){ d={pos:new Float32Array(0),rad:new Float32Array(0),val:new Float32Array(0),n:0}; }
     normalizeLayer(d.pos, d.n, f.norm);
-    const {col,bright}=colorize(d.n,d.rad,f.k);
+    const {col,bright}=colorize(d.n,d.rad,d.val,f.k);
     // trim to exact n
     const pos = d.n*3===d.pos.length ? d.pos : d.pos.subarray(0,d.n*3);
-    layers[f.k]=makeLayer(pos,col,bright,f.size);
+    layers[f.k]=makeLayer(pos,col,bright,f.size,f.exp);
     counts[f.k]=d.n; totalN+=d.n;
     document.getElementById('ct-'+f.k).textContent=fmt(d.n);
     setProg(f.p[1]);
