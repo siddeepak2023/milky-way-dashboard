@@ -63,11 +63,17 @@ def fetch_url(url, label="", binary=False):
 # ── STARS: Gaia DR3 ────────────────────────────────────────────────────────────
 def load_stars_gaia(limit=GAIA_LIMIT):
     print(f"\n[STARS] Querying Gaia DR3 for {limit:,} real stars...")
+    # ORDER BY random_index is essential, not cosmetic. gaia_source is stored in
+    # source_id order, which is a HEALPix index — so a bare TOP N returns one
+    # contiguous PATCH OF SKY. The old query yielded 500,000 stars spanning only
+    # ~25 distinct sky directions: a wedge, not the Milky Way. random_index is
+    # Gaia's own precomputed shuffle for drawing unbiased all-sky subsets.
     adql = (
         f"SELECT TOP {limit} parallax,l,b,phot_g_mean_mag,bp_rp "
         f"FROM gaiadr3.gaia_source "
         f"WHERE parallax>0.5 AND parallax_over_error>10 "
-        f"AND phot_g_mean_mag<18 AND l IS NOT NULL AND b IS NOT NULL"
+        f"AND phot_g_mean_mag<18 AND l IS NOT NULL AND b IS NOT NULL "
+        f"ORDER BY random_index"
     )
     url = ("https://gea.esac.esa.int/tap-server/tap/sync?"
            "REQUEST=doQuery&LANG=ADQL&FORMAT=csv&QUERY=" + urllib.parse.quote(adql))
