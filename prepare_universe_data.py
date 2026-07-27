@@ -135,6 +135,9 @@ def load_galaxies_hyperleda(limit=HYPERLEDA_LIMIT):
     df = df[df["cz"] > 100]
     print(f"  Valid galaxies: {len(df):,}")
     df["distance_mpc"] = df["cz"] / HUBBLE_CONSTANT
+    # Keep redshift so the viewer can colour galaxies by real epoch instead of a
+    # flat per-layer colour. cz is a recession velocity in km/s.
+    df["redshift"] = df["cz"] / 299792.458
     coords = SkyCoord(ra=df["ra"].values*u.deg, dec=df["dec"].values*u.deg,
                       distance=df["distance_mpc"].values*u.Mpc, frame="icrs")
     df["x"] = coords.cartesian.x.to(u.Mpc).value * 1e6
@@ -222,14 +225,20 @@ def load_quasars(limit=QUASAR_LIMIT):
     df = df[df["z"] > 0.01]
     print(f"  Valid quasars: {len(df):,}")
     c_over_H0 = 3e5 / HUBBLE_CONSTANT
-    df["distance_mpc"] = c_over_H0 * df["z"] * (1 + df["z"]*(-0.5 + df["z"]*0.167))
+    # Rename the REDSHIFT column before computing cartesian coords. The old code
+    # kept it as "z" and then did rename({"z_pos": "z"}), producing two columns
+    # named "z"; df[["x","y","z","r"]] then selected the FIRST one, so the quasar
+    # layer's Z axis was plotting redshift instead of a spatial coordinate — the
+    # whole layer collapsed to a flat sheet (z extent 1.4 against x/y of ~3.9e9).
+    df = df.rename(columns={"z": "redshift"})
+    df["distance_mpc"] = c_over_H0 * df["redshift"] * (1 + df["redshift"]*(-0.5 + df["redshift"]*0.167))
     coords = SkyCoord(ra=df["ra"].values*u.deg, dec=df["dec"].values*u.deg,
                       distance=df["distance_mpc"].values*u.Mpc, frame="icrs")
-    df["x"]     = coords.cartesian.x.to(u.Mpc).value * 1e6
-    df["y"]     = coords.cartesian.y.to(u.Mpc).value * 1e6
-    df["z_pos"] = coords.cartesian.z.to(u.Mpc).value * 1e6
-    df["r"]     = np.sqrt(df["x"]**2 + df["y"]**2 + df["z_pos"]**2)
-    return df.rename(columns={"z_pos":"z"})
+    df["x"] = coords.cartesian.x.to(u.Mpc).value * 1e6
+    df["y"] = coords.cartesian.y.to(u.Mpc).value * 1e6
+    df["z"] = coords.cartesian.z.to(u.Mpc).value * 1e6
+    df["r"] = np.sqrt(df["x"]**2 + df["y"]**2 + df["z"]**2)
+    return df
 
 # ── GALAXY CLUSTERS: Planck PSZ2 via Vizier ────────────────────────────────────
 def load_clusters():
