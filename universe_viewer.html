@@ -465,6 +465,10 @@ addEventListener('resize',()=>{
   camera.aspect=innerWidth/innerHeight; camera.updateProjectionMatrix();
   renderer.setSize(innerWidth,innerHeight); composer.setSize(innerWidth,innerHeight);
 });
+// Debug hook for performance work: lets a console session add synthetic layers and
+// measure the real point-count ceiling on this GPU instead of guessing.
+window.__cosmos={THREE,scene,renderer,composer,camera,layers,layerData,makeLayer,applyPalette};
+
 boot(); requestAnimationFrame(tick);
 </script>
 </body>
