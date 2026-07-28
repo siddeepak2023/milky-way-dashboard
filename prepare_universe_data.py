@@ -419,7 +419,7 @@ def load_filaments(page=2000):
     lo = 1
     while True:
         adql = (
-            f'SELECT ID, IDpt, x, y, z FROM "{FILAMENT_TABLE}" '
+            f'SELECT ID, IDpt, x, y, z, Len, fden FROM "{FILAMENT_TABLE}" '
             f"WHERE ID >= {lo} AND ID < {lo + page} ORDER BY ID, IDpt"
         )
         try:
@@ -450,8 +450,9 @@ def load_filaments(page=2000):
 
     df = pd.concat(frames, ignore_index=True)
     df.columns = [c.strip() for c in df.columns]
-    for c in ("ID", "IDpt", "x", "y", "z"):
+    for c in ("ID", "IDpt", "x", "y", "z", "Len", "fden"):
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    # Len/fden may be blank for a point; position must not be.
     df = df.dropna(subset=["ID", "IDpt", "x", "y", "z"]).sort_values(["ID", "IDpt"])
     print(f"  Spine points: {len(df):,} across {df['ID'].nunique():,} filaments")
 
@@ -462,16 +463,42 @@ def load_filaments(page=2000):
     # Vectorised polyline -> segment pairs: pair each row with the next, then drop
     # pairs that straddle a filament boundary. A per-row Python loop over 275k rows
     # is needlessly slow here.
-    cur = df[["ID", "x", "y", "z"]].to_numpy()
-    nxt = cur[1:]
-    cur = cur[:-1]
+    cur_all = df[["ID", "x", "y", "z"]].to_numpy()
+    fden_all = df["fden"].to_numpy()
+    len_all = df["Len"].to_numpy()
+    nxt = cur_all[1:]
+    cur = cur_all[:-1]
     same = cur[:, 0] == nxt[:, 0]
+
+    seg_len = np.sqrt(((nxt[:, 1:4] - cur[:, 1:4]) ** 2).sum(axis=1))
+
+    # Arc length along each filament, normalised 0..1 per filament, so the shader can
+    # run a travelling pulse along a spine without knowing anything about topology.
+    # Cumulative sum of segment lengths, reset at every filament boundary.
+    step = np.where(same, seg_len, 0.0)
+    cum = np.concatenate([[0.0], np.cumsum(step)])
+    ids = cur_all[:, 0]
+    # subtract each filament's starting cumulative value, then divide by its span
+    first = pd.Series(cum).groupby(ids).transform("first").to_numpy()
+    span = pd.Series(cum).groupby(ids).transform("last").to_numpy() - first
+    span = np.where(span > 0, span, 1.0)
+    t = (cum - first) / span
+
     seg = pd.DataFrame(
         {
             "x1": cur[same, 1], "y1": cur[same, 2], "z1": cur[same, 3],
             "x2": nxt[same, 1], "y2": nxt[same, 2], "z2": nxt[same, 3],
+            # arc position of each endpoint within its filament, 0 at one end, 1 at the other
+            "t1": t[:-1][same], "t2": t[1:][same],
+            # Bisous weighted visit-map value, 0..1 — how strongly the finder believes
+            # this point is filament spine. A real per-segment scalar, mean of endpoints.
+            "fden": np.nanmean(np.vstack([fden_all[:-1][same], fden_all[1:][same]]), axis=0),
+            # length in Mpc/h of the filament this segment belongs to
+            "flen": len_all[:-1][same],
         }
     )
+    seg["fden"] = seg["fden"].fillna(0.0)
+    seg["flen"] = seg["flen"].fillna(0.0)
     print(f"  Filament segments: {len(seg):,}")
     return seg
 

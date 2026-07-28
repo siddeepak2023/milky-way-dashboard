@@ -82,7 +82,7 @@
     <p>Gaia&nbsp;DR3&nbsp;·&nbsp;2MRS&nbsp;Galaxies&nbsp;·&nbsp;NASA&nbsp;Exoplanets&nbsp;·&nbsp;SDSS&nbsp;Quasars</p>
   </div>
 
-  <div id="hint">Drag to orbit · scroll to zoom · <b>right-drag</b> to pan. Pick a tour below.</div>
+  <div id="hint">Drag to orbit · scroll to zoom · <b>right-drag</b> to pan · <b>WASD</b>/arrows to fly, <b>R/F</b> up-down, <b>Shift</b> to boost. Pick a tour below.</div>
 
   <div id="panel" class="glass">
     <h2>Layers <span id="total">—</span></h2>
@@ -292,7 +292,9 @@ function normalizeOctree(O,target){
 // so it does not use the CSM3 octree: 260,178 segments at 12 B each is 3.0 MB and
 // draws in one call, which is cheaper than any culling scheme would be.
 //   header  32 B : "CSMF" | u32 version,segCount | f32 bmin[3], edge
-//   segment 12 B : u16 x1,y1,z1,x2,y2,z2  (one global cube, isotropic step)
+//   segment 14 B : u16 x1,y1,z1,x2,y2,z2 | u8 t1,t2  (one global cube, isotropic step)
+// t is each endpoint's normalised arc position along its own filament, so the pulse
+// in filFrag travels the spine without the CPU walking any topology per frame.
 async function loadFilaments(url,onP){
   const res=await fetch(url);
   if(!res.ok) throw new Error(url+': HTTP '+res.status);
@@ -305,19 +307,27 @@ async function loadFilaments(url,onP){
   if(!(len>32 && bytes[0]===0x43&&bytes[1]===0x53&&bytes[2]===0x4d&&bytes[3]===0x46)) throw new Error(url+': not a CSMF file');
   const dv=new DataView(bytes.buffer);
   const version=dv.getUint32(4,true), segCount=dv.getUint32(8,true);
-  if(version!==1) throw new Error(url+': unsupported CSMF version '+version);
+  if(version!==2) throw new Error(url+': unsupported CSMF version '+version+' (expected 2 — repack with pack_filaments.py)');
   const bx=dv.getFloat32(12,true), by=dv.getFloat32(16,true), bz=dv.getFloat32(20,true);
   const edge=dv.getFloat32(24,true), e=edge/65535;
 
-  // two endpoints per segment → LineSegments wants them consecutive
-  const q=new Uint16Array(bytes.buffer,28,segCount*6);
+  // two endpoints per segment → LineSegments wants them consecutive.
+  // Stride is 14 B, which is not a multiple of 4, so the u16 view cannot span the
+  // whole block; read each record from the DataView at its own offset instead.
   const pos=new Float32Array(segCount*6);
+  const arc=new Float32Array(segCount*2);
   for(let i=0;i<segCount;i++){
-    const o=i*6;
-    pos[o  ]=bx+q[o  ]*e; pos[o+1]=by+q[o+1]*e; pos[o+2]=bz+q[o+2]*e;
-    pos[o+3]=bx+q[o+3]*e; pos[o+4]=by+q[o+4]*e; pos[o+5]=bz+q[o+5]*e;
+    const o=28+i*14, p=i*6, a=i*2;
+    pos[p  ]=bx+dv.getUint16(o   ,true)*e;
+    pos[p+1]=by+dv.getUint16(o+2 ,true)*e;
+    pos[p+2]=bz+dv.getUint16(o+4 ,true)*e;
+    pos[p+3]=bx+dv.getUint16(o+6 ,true)*e;
+    pos[p+4]=by+dv.getUint16(o+8 ,true)*e;
+    pos[p+5]=bz+dv.getUint16(o+10,true)*e;
+    arc[a  ]=bytes[o+12]/255;
+    arc[a+1]=bytes[o+13]/255;
   }
-  return {pos,segCount,n:segCount*2,bytes:len};
+  return {pos,arc,segCount,n:segCount*2,bytes:len};
 }
 
 // Same centroid-and-98th-percentile transform the point layers get, so the web
@@ -338,24 +348,38 @@ function normalizeFilaments(F,target){
 // Additive lines with distance extinction. gl.LINES ignores linewidth on every
 // desktop GL driver, so depth is carried by opacity rather than thickness.
 const filVert=`
+  attribute float aArc;
   uniform float uFade;
-  varying float vF;
+  varying float vF; varying float vT;
   void main(){
     vec4 mv=modelViewMatrix*vec4(position,1.0);
     vF=exp(-max(-mv.z,0.0)*uFade);      // nearer = brighter
+    vT=aArc;
     gl_Position=projectionMatrix*mv;
   }`;
+// The pulse is interpolated across each segment from its two endpoint arc values,
+// so it slides continuously along a spine instead of blinking per segment. Pure
+// display: it moves light along real geometry and changes no measured quantity.
 const filFrag=`
   precision mediump float;
-  uniform vec3 uColor; uniform float uOpacity;
-  varying float vF;
-  void main(){ gl_FragColor=vec4(uColor*vF, vF*uOpacity); }`;
+  uniform vec3 uColor; uniform float uOpacity; uniform float uTime;
+  uniform float uFlow; uniform float uPulses;
+  varying float vF; varying float vT;
+  void main(){
+    float phase=fract(vT*uPulses - uTime*uFlow);
+    // narrow bright head with a trailing falloff
+    float pulse=pow(1.0-phase, 14.0);
+    float lum=vF*(1.0+pulse*2.2);
+    gl_FragColor=vec4(uColor*lum, lum*uOpacity);
+  }`;
 
 function makeFilamentLayer(F,cfg){
   const g=new THREE.BufferGeometry();
   g.setAttribute('position',new THREE.BufferAttribute(F.pos,3));
+  g.setAttribute('aArc',new THREE.BufferAttribute(F.arc,1));
   const m=new THREE.ShaderMaterial({
-    uniforms:{uColor:{value:new THREE.Color(cfg.color)},uOpacity:{value:cfg.opacity},uFade:{value:cfg.fade}},
+    uniforms:{uColor:{value:new THREE.Color(cfg.color)},uOpacity:{value:cfg.opacity},uFade:{value:cfg.fade},
+              uTime:{value:0},uFlow:{value:cfg.flow},uPulses:{value:cfg.pulses}},
     vertexShader:filVert,fragmentShader:filFrag,
     transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
   });
@@ -622,7 +646,11 @@ async function boot(){
     // at a natural viewing distance of ~1100 this leaves ~63% transmission. The first
     // value tried, 0.0016, left 16% and made the whole web nearly invisible from
     // outside — measured, not guessed.
-    layers.filaments=makeFilamentLayer(F,{color:0x7fb2ff,opacity:0.8,fade:0.0004});
+    // flow=0 for anyone who asked the OS for reduced motion — the web still renders,
+    // it just stops travelling.
+    const calm=matchMedia('(prefers-reduced-motion: reduce)').matches;
+    layers.filaments=makeFilamentLayer(F,{color:0x7fb2ff,opacity:0.8,fade:0.0004,
+                                          flow:calm?0:0.09,pulses:3.0});
     counts.filaments=F.segCount;
     document.getElementById('ct-filaments').textContent=fmt(F.segCount);
     totalBytes+=F.bytes;
@@ -681,6 +709,61 @@ document.querySelectorAll('.tour').forEach(b=>{
 });
 function intro(){ camera.position.set(0,40,2600); flyTo([0,120,560],[0,0,0],3200); }
 
+// ── flight controls ────────────────────────────────────────────────────
+// WASD/arrows fly; R/F climb and dive; Shift boosts. OrbitControls stays in charge
+// of looking around, so flying moves the camera AND its orbit target by the same
+// vector — otherwise the next drag would swing you back to wherever the target was
+// left behind.
+//
+// Speed is proportional to distance from the centre, because this scene spans four
+// orders of magnitude between the exoplanet shell (26) and the quasar shell (1000).
+// A fixed speed that feels right among the stars would take minutes to cross the
+// quasar field, and would be unusable once you are inside the star cloud.
+const keys=new Set();
+const FLY={forward:['keyw','arrowup'],back:['keys','arrowdown'],
+           left:['keya','arrowleft'],right:['keyd','arrowright'],
+           up:['keyr'],down:['keyf']};
+function typingInAField(){
+  const el=document.activeElement;
+  if(!el) return false;
+  const t=el.tagName;
+  // range inputs use the arrow keys themselves — don't steal them
+  return t==='INPUT'||t==='TEXTAREA'||t==='SELECT'||el.isContentEditable;
+}
+addEventListener('keydown',e=>{
+  if(typingInAField()) return;
+  const c=e.code.toLowerCase();
+  const known=Object.values(FLY).some(list=>list.includes(c));
+  if(known){ keys.add(c); e.preventDefault(); }        // stop arrows scrolling the page
+  if(c==='shiftleft'||c==='shiftright') keys.add('shift');
+});
+addEventListener('keyup',e=>{
+  const c=e.code.toLowerCase();
+  keys.delete(c);
+  if(c==='shiftleft'||c==='shiftright') keys.delete('shift');
+});
+// a lost focus event means keys that are still held would stick down forever
+addEventListener('blur',()=>keys.clear());
+
+const _fwd=new THREE.Vector3(), _right=new THREE.Vector3(), _up=new THREE.Vector3(0,1,0), _move=new THREE.Vector3();
+function held(action){ return FLY[action].some(c=>keys.has(c)); }
+function updateFlight(dt){
+  const f=held('forward')-held('back'), s=held('right')-held('left'), u=held('up')-held('down');
+  if(!f&&!s&&!u) return false;
+  camera.getWorldDirection(_fwd);
+  _right.crossVectors(_fwd,_up).normalize();
+  // 45% of the distance to centre per second, so travel is scale-free
+  const dist=Math.max(camera.position.distanceTo(controls.target),2);
+  const speed=dist*0.45*(keys.has('shift')?3.5:1)*dt;
+  _move.set(0,0,0)
+    .addScaledVector(_fwd,f*speed)
+    .addScaledVector(_right,s*speed)
+    .addScaledVector(_up,u*speed);
+  camera.position.add(_move);
+  controls.target.add(_move);      // keep orbit anchored ahead of the camera
+  return true;
+}
+
 // ── render loop ────────────────────────────────────────────────────────
 const ease=t=>t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
 let last=performance.now(), fEl=document.getElementById('r-fps'), dEl=document.getElementById('r-dist');
@@ -697,8 +780,12 @@ function tick(now){
   }
   // drift (auto-rotate the whole cosmos — layers are children of the scene)
   const rot=+sR.value;
-  if(rot>0 && !tween){ scene.rotation.y += rot*dt*0.04; }
+  // drift is ambience; hold it while the viewer is actively flying or the scene
+  // slides under you as you try to aim
+  if(rot>0 && !tween && !flying){ scene.rotation.y += rot*dt*0.04; }
+  const flying=updateFlight(Math.min(dt,0.05));   // clamp dt so a stalled tab can't teleport you
   controls.update();
+  if(layers.filaments) layers.filaments.material.uniforms.uTime.value=now*0.001;
   updateLOD();
   composer.render();
   // hud
@@ -718,7 +805,7 @@ addEventListener('resize',()=>{
 // Debug hook for performance work: lets a console session add synthetic layers and
 // measure the real point-count ceiling on this GPU instead of guessing.
 window.__cosmos={THREE,scene,renderer,composer,camera,controls,layers,octrees,counts,applyPalette,
-  fil:()=>filaments,
+  fil:()=>filaments, keys, updateFlight,
   updateLOD,lod:()=>lodStats,
   budget:v=>{ if(v!=null) POINT_BUDGET=v; return POINT_BUDGET; },
   minPx:v=>{ if(v!=null) MIN_PX=v; return MIN_PX; }};
