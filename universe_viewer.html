@@ -110,7 +110,7 @@
   </div>
 
   <div id="read">
-    <div><b id="r-fps">60</b> fps · <b id="r-pts">0</b> objects rendered</div>
+    <div><b id="r-fps">60</b> fps · <b id="r-pts">0</b> points drawn this frame in <b id="r-nodes">0</b> octree nodes</div>
     <div>distance to centre <b id="r-dist">—</b></div>
   </div>
 </div>
@@ -172,6 +172,9 @@ const vert=`
   uniform float uSize; uniform float uScale;
   varying float vB; varying vec3 vC;
   void main(){
+    // uSize already carries this octree node's LOD size compensation (see
+    // makeOctreeLayer): a coarse node draws a random subsample of its region, so
+    // its sprites are larger to keep the region's total brightness.
     vB=aBright; vC=aColor;
     vec4 mv=modelViewMatrix*vec4(position,1.0);
     float d=-mv.z;
@@ -198,28 +201,19 @@ const frag=`
     gl_FragColor=vec4(col,a);
   }`;
 
-function makeLayer(pos,col,bright,sizeMul,exposure){
-  const g=new THREE.BufferGeometry();
-  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
-  g.setAttribute('aColor',new THREE.BufferAttribute(col,3));
-  g.setAttribute('aBright',new THREE.BufferAttribute(bright,1));
-  const m=new THREE.ShaderMaterial({
-    uniforms:{uSize:{value:1.0*sizeMul},uScale:{value:260.0},uExposure:{value:exposure??1.0}},
-    vertexShader:vert,fragmentShader:frag,
-    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
-  });
-  const pts=new THREE.Points(g,m); pts.frustumCulled=false; pts.userData.sizeMul=sizeMul;
-  scene.add(pts); return pts;
-}
-
-// ── binary load → typed arrays ─────────────────────────────────────────
-// v2 .bin: header "CSMS" + uint32 version/count/stride, then Float32
-// [x,y,z,size,value] per point. `value` is that layer's real measured scalar
-// (bp_rp for stars, redshift for galaxies/quasars) — NaN where unmeasured.
-// v1 files (bare Float32 [x,y,z,r]) still load; their value comes back NaN so
-// colour falls back to neutral instead of being invented.
-async function loadBin(url,onP){
+// ── v3 octree binary load ──────────────────────────────────────────────
+// Written by pack_octree.py. 8 B/point instead of v2's 20 B, and the points are
+// grouped into octree nodes so the renderer can draw only what is near and
+// on-screen instead of the whole catalogue every frame.
+//   header 32 B : "CSM3" | u32 version,nodeCount,pointCount | f32 vmin,vmax,smin,smax
+//   node   64 B : f32 bx,by,bz,edge | u32 offset,count,level,subtree | i32 child[8]
+//   point   8 B : u16 qx,qy,qz (inside the node cube) | u8 qs | u8 qv
+// qv === 255 means "no measured value" → NaN → neutral colour, never invented.
+// Positions are quantized per NODE, so precision is nodeEdge/65535 rather than
+// catalogueEdge/65535 — far below any structure the viewer can resolve.
+async function loadOctree(url,onP){
   const res=await fetch(url);
+  if(!res.ok) throw new Error(url+': HTTP '+res.status);
   const total=+res.headers.get('content-length')||0;
   const reader=res.body.getReader();
   const chunks=[]; let got=0;
@@ -227,34 +221,53 @@ async function loadBin(url,onP){
   let len=0; for(const c of chunks) len+=c.length;
   const bytes=new Uint8Array(len); let off=0; for(const c of chunks){ bytes.set(c,off); off+=c.length; }
 
-  const hasHdr = len>16 && bytes[0]===0x43 && bytes[1]===0x53 && bytes[2]===0x4d && bytes[3]===0x53; // "CSMS"
-  let stride=4, n=0, f;
-  if(hasHdr){
-    const h=new DataView(bytes.buffer,4,12);
-    const version=h.getUint32(0,true); n=h.getUint32(4,true); stride=h.getUint32(8,true);
-    if(version!==2) console.warn(url+': unknown version '+version+', reading as stride '+stride);
-    f=new Float32Array(bytes.buffer, 16, n*stride);
-  }else{
-    f=new Float32Array(bytes.buffer, 0, (len/4)|0);
-    n=(f.length/4)|0;
+  if(!(len>32 && bytes[0]===0x43&&bytes[1]===0x53&&bytes[2]===0x4d&&bytes[3]===0x33)) throw new Error(url+': not a CSM3 file');
+  const dv=new DataView(bytes.buffer);
+  const version=dv.getUint32(4,true), nodeCount=dv.getUint32(8,true), n=dv.getUint32(12,true);
+  if(version!==3) throw new Error(url+': unsupported CSM3 version '+version);
+  const vmin=dv.getFloat32(16,true), vmax=dv.getFloat32(20,true);
+  const smin=dv.getFloat32(24,true), smax=dv.getFloat32(28,true);
+
+  const nodes=new Array(nodeCount);
+  for(let i=0;i<nodeCount;i++){
+    const o=32+i*64, child=new Int32Array(8);
+    for(let c=0;c<8;c++) child[c]=dv.getInt32(o+32+c*4,true);
+    nodes[i]={ bmin:[dv.getFloat32(o,true),dv.getFloat32(o+4,true),dv.getFloat32(o+8,true)],
+               edge:dv.getFloat32(o+12,true),
+               offset:dv.getUint32(o+16,true), count:dv.getUint32(o+20,true),
+               level:dv.getUint32(o+24,true), subtree:dv.getUint32(o+28,true),
+               child, pts:null, center:new THREE.Vector3(), radius:0 };
   }
 
+  const pOff=32+nodeCount*64;                       // multiple of 4 → 16-bit aligned
+  const u16=new Uint16Array(bytes.buffer,pOff,n*4);
+  const u8 =new Uint8Array (bytes.buffer,pOff,n*8);
   const pos=new Float32Array(n*3), rad=new Float32Array(n), val=new Float32Array(n);
-  for(let i=0;i<n;i++){
-    const o=i*stride;
-    pos[i*3]=f[o]; pos[i*3+1]=f[o+1]; pos[i*3+2]=f[o+2];
-    rad[i]=f[o+3];
-    val[i]= stride>=5 ? f[o+4] : NaN;
+  const ds=(smax-smin)/254, dvv=(vmax-vmin)/254;
+  let unmeasured=0;
+  for(const nd of nodes){
+    const e=nd.edge/65535, bx=nd.bmin[0], by=nd.bmin[1], bz=nd.bmin[2];
+    for(let i=nd.offset, end=nd.offset+nd.count; i<end; i++){
+      const q=i*4, b=i*8;
+      pos[i*3  ]=bx+u16[q  ]*e;
+      pos[i*3+1]=by+u16[q+1]*e;
+      pos[i*3+2]=bz+u16[q+2]*e;
+      rad[i]=smin+u8[b+6]*ds;
+      const qv=u8[b+7];
+      if(qv===255){ val[i]=NaN; unmeasured++; } else val[i]=vmin+qv*dvv;
+    }
   }
-  return {pos,rad,val,n};
+  return {nodes,pos,rad,val,n,unmeasured,bytes:len};
 }
 
 // Each dataset lives in its own physical coordinate frame & scale (Gaia stars
-// ~1e3, 2MRS galaxies ~1e8, SDSS quasars ~1e9). Recenter each layer on its
-// centroid and rescale so its 98th-percentile radius maps to a target shell
+// ~1e3 pc, 2MRS galaxies ~1e8 pc, SDSS quasars ~1e9 pc). Recenter each layer on
+// its centroid and rescale so its 98th-percentile radius maps to a target shell
 // radius → concentric "shells of the universe" that share one camera scale.
-function normalizeLayer(pos,n,target){
-  if(n<1) return;
+// The octree node cubes are carried through the same transform, since the LOD
+// walker culls and scores against them in scene units.
+function normalizeOctree(O,target){
+  const {pos,n,nodes}=O; if(n<1) return;
   let cx=0,cy=0,cz=0;
   for(let i=0;i<n;i++){cx+=pos[i*3];cy+=pos[i*3+1];cz+=pos[i*3+2];}
   cx/=n;cy/=n;cz/=n;
@@ -264,6 +277,12 @@ function normalizeLayer(pos,n,target){
   let p=sorted[Math.floor(0.98*(n-1))]||1; if(p<=0)p=1;
   const s=target/p;
   for(let i=0;i<n;i++){ pos[i*3]=(pos[i*3]-cx)*s; pos[i*3+1]=(pos[i*3+1]-cy)*s; pos[i*3+2]=(pos[i*3+2]-cz)*s; }
+  for(const nd of nodes){
+    nd.bmin=[(nd.bmin[0]-cx)*s,(nd.bmin[1]-cy)*s,(nd.bmin[2]-cz)*s];
+    nd.edge*=s;
+    nd.center.set(nd.bmin[0]+nd.edge/2,nd.bmin[1]+nd.edge/2,nd.bmin[2]+nd.edge/2);
+    nd.radius=nd.edge*0.8660254;            // half the cube's space diagonal
+  }
 }
 
 // Ballesteros (2012) colour-index → effective temperature. Derived for B−V;
@@ -342,20 +361,143 @@ function colorize(n,rad,val,kind,mode){
   return {col:c,bright:b};
 }
 
-const layers={};
+const layers={};                    // k → THREE.Group of per-node Points
+const octrees={};                   // k → {nodes,pos,rad,val,n,col,...}
 const counts={};
-const layerData={};                 // keeps rad/val so the palette can be re-derived
 let paletteMode='vivid';
 function fmt(n){return n.toLocaleString();}
+
+// One THREE.Points per octree node, all sharing the same shader program. Node
+// geometries are views into the layer's single decoded buffer, so grouping costs
+// no extra memory — it buys per-node frustum culling and LOD.
+function makeOctreeLayer(O,cfg){
+  const {col,bright}=colorize(O.n,O.rad,O.val,cfg.k,paletteMode);
+  O.col=col; O.bright=bright;
+  const group=new THREE.Group(); scene.add(group);
+  // Reference spacing = the finest node in the tree, so the deepest level keeps
+  // the sizing the flat renderer had and only coarser levels grow.
+  let refSpacing=Infinity;
+  for(const nd of O.nodes){ if(!nd.count) continue;
+    const sp=nd.edge/Math.cbrt(nd.count); if(sp<refSpacing) refSpacing=sp; }
+  if(!(refSpacing>0)||!isFinite(refSpacing)) refSpacing=1;
+  for(const nd of O.nodes){
+    if(!nd.count) continue;
+    const g=new THREE.BufferGeometry();
+    g.setAttribute('position',new THREE.BufferAttribute(O.pos.subarray(nd.offset*3,(nd.offset+nd.count)*3),3));
+    g.setAttribute('aColor', new THREE.BufferAttribute(col.subarray(nd.offset*3,(nd.offset+nd.count)*3),3));
+    g.setAttribute('aBright',new THREE.BufferAttribute(bright.subarray(nd.offset,nd.offset+nd.count),1));
+    // A coarse node draws a random subsample of its region, so its points must
+    // carry more light each or the field dims every time the walker steps up a
+    // level. Two ways to pay for that: bigger sprites (costs fill rate) or
+    // brighter sprites (nearly free). Measured at 1280x720, compensating purely
+    // by radius cost 30.7 ms/frame at the close camera against 17.1 ms with no
+    // compensation at all — the enlarged sprites are pure overdraw under additive
+    // blending. So most of the compensation is exposure and only a little is size,
+    // which still helps close the visible gaps between sparse points.
+    // Both are display settings, not data: they change how much light a point
+    // emits, never its position, colour hue or measured value.
+    const lod=(nd.edge/Math.cbrt(nd.count))/refSpacing;
+    const sizeMul=cfg.size*Math.min(3.0,Math.pow(lod,0.5));
+    const exposure=(cfg.exp??1.0)*Math.min(4.0,Math.pow(lod,1.5));
+    const m=new THREE.ShaderMaterial({
+      uniforms:{uSize:{value:sizeMul},uScale:{value:260.0},uExposure:{value:exposure}},
+      vertexShader:vert,fragmentShader:frag,
+      transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
+    });
+    const pts=new THREE.Points(g,m);
+    pts.frustumCulled=false;          // the LOD walker culls whole subtrees itself
+    pts.visible=false;
+    pts.userData={sizeMul,node:nd};
+    nd.pts=pts; group.add(pts);
+  }
+  return group;
+}
+
+// ── LOD walker ─────────────────────────────────────────────────────────
+// Best-first descent under a hard point budget: a node's score is its projected
+// screen radius in pixels, so near/large nodes get detail first and the frame
+// cost stays bounded no matter how big the catalogue is. Parent and child point
+// sets are disjoint (the packer partitions, it never duplicates), so drawing a
+// parent plus some of its children double-counts nothing.
+const _frustum=new THREE.Frustum(), _clip=new THREE.Matrix4(), _inv=new THREE.Matrix4();
+const _sph=new THREE.Sphere(), _camLocal=new THREE.Vector3();
+// Both tunables were measured at 1440x900 with devicePixelRatio 2 (a 2880x1800
+// backbuffer), camera at the default overview [0,120,560], on this machine's GPU.
+//
+// POINT_BUDGET is a backstop, not the active control: the walker never reached it
+// at 849,918 points. The most it ever drew was ~724k, at the close camera. It
+// exists so a larger catalogue degrades by shedding detail instead of dropping
+// frames.
+let POINT_BUDGET=1_200_000;
+// MIN_PX is what actually decides detail. It was 160, which drew only 386k of
+// 849,918 — 45% — at the default view. Sweep at that camera, timed with a
+// gl.finish() after every frame (without the sync, performance.now() measures
+// command submission rather than completion and the numbers move by 6x run to
+// run, which is how the first pass at this measurement went wrong):
+//   160px → 386,726 pts, 0.93 ms      80px → 590,414 pts, 3.42 ms
+//    40px → 808,388 pts, 3.94 ms      20px → 814,726 pts, 4.17 ms
+// 20px is where it saturates — what is left is genuinely outside the frustum.
+// So 40 buys 95.1% of the catalogue for ~4 ms, i.e. 250 fps of headroom, and the
+// frame is indistinguishable from drawing everything: mean framebuffer luminance
+// matches to within 0.7% and the clipped-pixel fraction is identical at 3.12%.
+// Detail was being discarded to save 3 ms nobody could perceive.
+//
+// Not a speedup claim: forcing every node visible costs 10.63 ms, but that is not
+// what the old flat renderer did. It draws each coarse node's subsample on top of
+// the fine nodes covering the same region, and those sprites carry up to 3x size
+// compensation, so most of that cost is additive overdraw rather than a fair
+// baseline. The octree's honest wins are download size (6.51 MB against v2's
+// 12.8 MB) and frustum culling, plus the ability to shed detail on a weaker GPU.
+let MIN_PX=40;
+let lodStats={points:0,nodes:0,culled:0};
+
+function updateLOD(){
+  scene.updateMatrixWorld(true);
+  _clip.multiplyMatrices(camera.projectionMatrix,camera.matrixWorldInverse).multiply(scene.matrixWorld);
+  _frustum.setFromProjectionMatrix(_clip);                 // planes in scene-local space
+  _inv.copy(scene.matrixWorld).invert();
+  _camLocal.copy(camera.position).applyMatrix4(_inv);
+  const projFactor=(innerHeight*0.5)/Math.tan(camera.fov*0.5*Math.PI/180);
+  const score=nd=>{
+    const dist=Math.max(_camLocal.distanceTo(nd.center)-nd.radius, 1e-4);
+    return nd.radius/dist*projFactor;
+  };
+
+  const q=[];
+  for(const k in octrees){
+    const O=octrees[k]; if(!O) continue;
+    for(const nd of O.nodes) if(nd.pts) nd.pts.visible=false;
+    if(!layers[k]||!layers[k].visible) continue;
+    const root=O.nodes[0]; if(root&&root.pts) q.push({O,nd:root,s:score(root)});
+  }
+
+  let pts=0,nodes=0,culled=0;
+  while(q.length){
+    let bi=0; for(let i=1;i<q.length;i++) if(q[i].s>q[bi].s) bi=i;
+    const it=q.splice(bi,1)[0], nd=it.nd;
+    _sph.center.copy(nd.center); _sph.radius=nd.radius;
+    if(!_frustum.intersectsSphere(_sph)){ culled+=nd.subtree; continue; }   // whole subtree off-screen
+    if(nodes>0 && pts+nd.count>POINT_BUDGET) break;                          // budget spent
+    nd.pts.visible=true; pts+=nd.count; nodes++;
+    if(it.s>MIN_PX){
+      for(let c=0;c<8;c++){
+        const ci=nd.child[c]; if(ci<0) continue;
+        const ch=it.O.nodes[ci]; if(!ch||!ch.pts) continue;
+        q.push({O:it.O,nd:ch,s:score(ch)});
+      }
+    }
+  }
+  lodStats={points:pts,nodes,culled};
+}
 
 // Recolour in place from the same measured values — no reload, no refetch.
 function applyPalette(mode){
   paletteMode=mode;
-  for(const k in layerData){
-    const d=layerData[k]; if(!d||!layers[k]) continue;
-    const {col}=colorize(d.n,d.rad,d.val,k,mode);
-    const attr=layers[k].geometry.getAttribute('aColor');
-    attr.array.set(col); attr.needsUpdate=true;
+  for(const k in octrees){
+    const O=octrees[k]; if(!O||!O.col) continue;
+    const {col}=colorize(O.n,O.rad,O.val,k,mode);
+    O.col.set(col);
+    for(const nd of O.nodes) if(nd.pts) nd.pts.geometry.getAttribute('aColor').needsUpdate=true;
   }
   const el=document.getElementById('palLabel');
   if(el) el.textContent = mode==='true' ? 'TRUE COLOUR' : 'VIVID';
@@ -366,31 +508,29 @@ async function boot(){
   // exp = per-layer exposure. 500k stars pile up additively in a small volume, so
   // they need far less energy each than the 6k exoplanets do.
   const files=[
-    {k:'stars',    url:'stars.bin',    size:0.9, norm:70,   exp:0.10, p:[0,0.55]},
-    {k:'quasars',  url:'quasars.bin',  size:1.25,norm:1000, exp:0.55, p:[0.55,0.82]},
-    {k:'galaxies', url:'galaxies.bin', size:1.7, norm:320,  exp:0.85, p:[0.82,0.94]},
+    {k:'stars',    url:'stars_o.bin',    size:0.9, norm:70,   exp:0.10, p:[0,0.55]},
+    {k:'quasars',  url:'quasars_o.bin',  size:1.25,norm:1000, exp:0.55, p:[0.55,0.82]},
+    {k:'galaxies', url:'galaxies_o.bin', size:1.7, norm:320,  exp:0.85, p:[0.82,0.94]},
     // exoplanets are only 6,411 points inside the star cloud — they need real
     // presence or the 500k-star glow swallows them entirely
-    {k:'exo',      url:'exo.bin',      size:2.4, norm:26,   exp:0.32, p:[0.94,1.0]},
+    {k:'exo',      url:'exo_o.bin',      size:2.4, norm:26,   exp:0.32, p:[0.94,1.0]},
   ];
-  let totalN=0;
+  let totalN=0, totalBytes=0;
   for(const f of files){
     setProg(f.p[0], 'Loading '+f.k+'…');
-    let d;
-    try{ d=await loadBin(f.url, (fp)=>setProg(f.p[0]+(f.p[1]-f.p[0])*fp)); }
-    catch(e){ d={pos:new Float32Array(0),rad:new Float32Array(0),val:new Float32Array(0),n:0}; }
-    normalizeLayer(d.pos, d.n, f.norm);
-    layerData[f.k]={rad:d.rad,val:d.val,n:d.n};
-    const {col,bright}=colorize(d.n,d.rad,d.val,f.k,paletteMode);
-    // trim to exact n
-    const pos = d.n*3===d.pos.length ? d.pos : d.pos.subarray(0,d.n*3);
-    layers[f.k]=makeLayer(pos,col,bright,f.size,f.exp);
-    counts[f.k]=d.n; totalN+=d.n;
-    document.getElementById('ct-'+f.k).textContent=fmt(d.n);
+    let O=null;
+    try{ O=await loadOctree(f.url, (fp)=>setProg(f.p[0]+(f.p[1]-f.p[0])*fp)); }
+    catch(e){ console.error(e); document.getElementById('ct-'+f.k).textContent='failed'; setProg(f.p[1]); continue; }
+    normalizeOctree(O,f.norm);
+    octrees[f.k]=O;
+    layers[f.k]=makeOctreeLayer(O,f);
+    counts[f.k]=O.n; totalN+=O.n; totalBytes+=O.bytes;
+    document.getElementById('ct-'+f.k).textContent=fmt(O.n);
     setProg(f.p[1]);
   }
   document.getElementById('total').textContent=fmt(totalN);
-  document.getElementById('r-pts').textContent=fmt(totalN);
+  console.log('loaded '+fmt(totalN)+' points, '+(totalBytes/1048576).toFixed(2)+' MB of CSM3 across '
+    +Object.values(octrees).reduce((a,O)=>a+O.nodes.length,0)+' octree nodes');
   setProg(1,'Ready');
   // fade out loader
   const L=document.getElementById('load'); L.style.opacity='0'; setTimeout(()=>L.remove(),900);
@@ -402,9 +542,7 @@ document.querySelectorAll('.layer').forEach(el=>{
   el.addEventListener('click',()=>{
     const k=el.dataset.k; if(!k) return;   // .layer is reused by the palette row
     const on=el.classList.toggle('off');
-    if(layers[k]) layers[k].visible=!on;
-    let r=0; Object.keys(layers).forEach(key=>{ if(layers[key]&&layers[key].visible) r+=counts[key]||0; });
-    document.getElementById('r-pts').textContent=fmt(r);
+    if(layers[k]) layers[k].visible=!on;   // the LOD walker updates the readout
   });
 });
 document.getElementById('palToggle').addEventListener('click',()=>{
@@ -412,7 +550,9 @@ document.getElementById('palToggle').addEventListener('click',()=>{
 });
 const sB=document.getElementById('s-bloom'), sS=document.getElementById('s-size'), sR=document.getElementById('s-rot');
 sB.oninput=()=>{bloom.strength=+sB.value; document.getElementById('v-bloom').textContent=sB.value;};
-sS.oninput=()=>{document.getElementById('v-size').textContent=sS.value; Object.values(layers).forEach(p=>{if(p)p.material.uniforms.uSize.value=(+sS.value)*p.userData.sizeMul;});};
+sS.oninput=()=>{document.getElementById('v-size').textContent=sS.value;
+  const v=+sS.value;
+  Object.values(layers).forEach(g=>{ if(g) g.children.forEach(p=>{ p.material.uniforms.uSize.value=v*p.userData.sizeMul; }); });};
 sR.oninput=()=>{document.getElementById('v-rot').textContent=sR.value;};
 
 // camera tweening
@@ -441,6 +581,7 @@ function intro(){ camera.position.set(0,40,2600); flyTo([0,120,560],[0,0,0],3200
 // ── render loop ────────────────────────────────────────────────────────
 const ease=t=>t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
 let last=performance.now(), fEl=document.getElementById('r-fps'), dEl=document.getElementById('r-dist');
+const pEl=document.getElementById('r-pts'), nEl=document.getElementById('r-nodes');
 let frames=0,fAcc=0;
 function tick(now){
   const dt=(now-last)/1000; last=now;
@@ -455,9 +596,15 @@ function tick(now){
   const rot=+sR.value;
   if(rot>0 && !tween){ scene.rotation.y += rot*dt*0.04; }
   controls.update();
+  updateLOD();
   composer.render();
   // hud
-  frames++; fAcc+=dt; if(fAcc>=0.5){ fEl.textContent=Math.round(frames/fAcc); frames=0; fAcc=0; }
+  frames++; fAcc+=dt;
+  if(fAcc>=0.5){
+    fEl.textContent=Math.round(frames/fAcc); frames=0; fAcc=0;
+    pEl.textContent=fmt(lodStats.points);
+    nEl.textContent=lodStats.nodes;
+  }
   dEl.textContent=camera.position.length().toFixed(0);
   requestAnimationFrame(tick);
 }
@@ -467,7 +614,10 @@ addEventListener('resize',()=>{
 });
 // Debug hook for performance work: lets a console session add synthetic layers and
 // measure the real point-count ceiling on this GPU instead of guessing.
-window.__cosmos={THREE,scene,renderer,composer,camera,layers,layerData,makeLayer,applyPalette};
+window.__cosmos={THREE,scene,renderer,composer,camera,controls,layers,octrees,counts,applyPalette,
+  updateLOD,lod:()=>lodStats,
+  budget:v=>{ if(v!=null) POINT_BUDGET=v; return POINT_BUDGET; },
+  minPx:v=>{ if(v!=null) MIN_PX=v; return MIN_PX; }};
 
 boot(); requestAnimationFrame(tick);
 </script>

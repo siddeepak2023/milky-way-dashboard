@@ -4,3 +4,5 @@ __pycache__/
 # regenerable pipeline intermediates (40MB+); rebuild with fetch_stars_bprp.py
 *_points.csv
 .DS_Store
+stress_*.bin
+_bench_*.html
