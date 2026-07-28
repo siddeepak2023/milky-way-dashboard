@@ -383,124 +383,97 @@ def download_cmb():
     return False
 
 # ── FILAMENTS: Tempel et al. SDSS cosmic web ─────────────────────────────────
-def load_filaments():
+FILAMENT_TAP = "https://tapvizier.cds.unistra.fr/TAPVizieR/tap/sync"
+FILAMENT_TABLE = "J/MNRAS/438/3465/table2"
+
+
+def load_filaments(page=2000):
     """
-    Real cosmic web filaments from Tempel et al. (2014, 2016).
-    Each filament is a spine — a series of 3D points tracing the real
-    dark-matter/gas bridge between galaxy clusters, reconstructed from
-    SDSS galaxy positions using the Bisous process filament finder.
+    Real cosmic web filament spines from Tempel et al. (2014), MNRAS 438, 3465 —
+    "Detecting filamentary pattern in the cosmic web: a catalogue of filaments for
+    the SDSS", built with the Bisous process filament finder.
 
-    Source: VizieR catalogue J/A+A/566/A1 (Tempel et al. 2014)
-    Contains ~15,000 filament segments with real 3D positions in Mpc.
+    Source: VizieR J/MNRAS/438/3465/table2 ("Filament points properties"),
+    275,599 spine points across 15,421 filaments.
 
-    Output: filaments_points.csv
-      Each row = one filament endpoint pair (x1,y1,z1,x2,y2,z2)
-      Coordinates in same units as galaxies_points.csv (Mpc * 1e6)
+    An earlier version of this function queried J/A+A/566/A1/filaments. That table
+    does not exist and never did: J/A+A/566/A1 is Tempel's SDSS *galaxy and group*
+    catalogue, and the filament catalogue is in MNRAS, not A&A. The request returned
+    "No catalogue or table was specified or found." every time, which is why
+    filaments_points.csv was never produced while the README advertised the layer.
+
+    This table carries co-moving Cartesian x/y/z directly in Mpc/h, so there is no
+    RA/Dec conversion and no redshift-to-distance step — one less assumption than
+    every other layer in this pipeline. Converted here to parsecs (Mpc * 1e6) to
+    match the other *_points.csv files, dividing out h = HUBBLE_CONSTANT/100.
+
+    Output: filaments_points.csv, one row per segment: x1,y1,z1,x2,y2,z2
+    Consecutive points within a filament ID form its polyline, so a filament of
+    Npts points yields Npts-1 segments.
     """
-    print("\n[FILAMENTS] Fetching Tempel et al. SDSS cosmic web filaments...")
+    print("\n[FILAMENTS] Fetching Tempel et al. (2014) SDSS filament spines...")
+    print(f"  VizieR {FILAMENT_TABLE} via TAP")
 
-    # VizieR TAP service — Tempel 2014 filament spine points
-    # Table J/A+A/566/A1/filaments contains filament spine coordinates
-    vizier_url = (
-        "https://vizier.cds.unistra.fr/viz-bin/asu-tsv?"
-        "source=J/A+A/566/A1/filaments&"
-        "columns=Fil,Seg,RAdeg,DEdeg,z&"
-        "constraints=z%3E0"
-    )
-
-    csv_data = fetch_url(vizier_url, "Tempel filaments (VizieR J/A+A/566/A1)")
-
-    if csv_data is None:
-        # Fallback: try the 2016 updated catalogue
-        print("  Trying 2016 catalogue...")
-        vizier_url2 = (
-            "https://vizier.cds.unistra.fr/viz-bin/asu-tsv?"
-            "source=J/A+A/588/A14/filaments&"
-            "columns=Fil,Seg,RAdeg,DEdeg,Dist"
+    h = HUBBLE_CONSTANT / 100.0
+    frames = []
+    lo = 1
+    while True:
+        adql = (
+            f'SELECT ID, IDpt, x, y, z FROM "{FILAMENT_TABLE}" '
+            f"WHERE ID >= {lo} AND ID < {lo + page} ORDER BY ID, IDpt"
         )
-        csv_data = fetch_url(vizier_url2, "Tempel 2016 filaments")
+        try:
+            r = requests.post(
+                FILAMENT_TAP,
+                data={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": adql},
+                timeout=180,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            print(f"  Request failed for ID {lo}..{lo+page}: {e}")
+            return pd.DataFrame()
 
-    if csv_data is None:
-        print("  Filament download failed — will use algorithmic fallback in viewer")
-        return pd.DataFrame()
+        chunk = pd.read_csv(io.StringIO(r.text))
+        if len(chunk):
+            frames.append(chunk)
+            print(f"    ID {lo:>6}-{lo+page-1:<6} {len(chunk):>7,} points")
+        lo += page
+        # 15,421 filaments; stop once past the end and a page comes back empty
+        if lo > 16000 and not len(chunk):
+            break
+        if lo > 20000:
+            break
 
-    # Parse TSV — VizieR prepends comment lines with #
-    lines = [l for l in csv_data.split('\n') if not l.startswith('#') and l.strip()]
-    if len(lines) < 3:
+    if not frames:
         print("  No filament data returned")
         return pd.DataFrame()
 
-    try:
-        df = pd.read_csv(io.StringIO('\n'.join(lines)), sep='\t', dtype=str)
-        df.columns = [c.strip() for c in df.columns]
-        print(f"  Raw rows: {len(df):,}  columns: {list(df.columns)}")
-    except Exception as e:
-        print(f"  Parse error: {e}")
-        return pd.DataFrame()
+    df = pd.concat(frames, ignore_index=True)
+    df.columns = [c.strip() for c in df.columns]
+    for c in ("ID", "IDpt", "x", "y", "z"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["ID", "IDpt", "x", "y", "z"]).sort_values(["ID", "IDpt"])
+    print(f"  Spine points: {len(df):,} across {df['ID'].nunique():,} filaments")
 
-    # Identify coordinate columns flexibly
-    ra_col  = next((c for c in df.columns if 'RA'  in c.upper() or 'ra'  in c), None)
-    dec_col = next((c for c in df.columns if 'DE'  in c.upper() or 'dec' in c.lower()), None)
-    z_col   = next((c for c in df.columns if c.strip() in ['z','Dist','dist','redshift']), None)
-    fil_col = next((c for c in df.columns if 'Fil' in c or 'FIL' in c), None)
-    seg_col = next((c for c in df.columns if 'Seg' in c or 'SEG' in c), None)
+    # Mpc/h -> parsecs, matching galaxies_points.csv / quasars_points.csv
+    for c in ("x", "y", "z"):
+        df[c] = df[c] / h * 1e6
 
-    if not ra_col or not dec_col or not z_col:
-        print(f"  Missing columns. Found: {list(df.columns)}")
-        return pd.DataFrame()
-
-    for col in [ra_col, dec_col, z_col]:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    if fil_col: df[fil_col] = pd.to_numeric(df[fil_col], errors='coerce')
-    if seg_col: df[seg_col] = pd.to_numeric(df[seg_col], errors='coerce')
-
-    df = df.dropna(subset=[ra_col, dec_col, z_col])
-    df = df[df[z_col] > 0]
-    print(f"  Valid spine points: {len(df):,}")
-
-    # Convert redshift/distance to Mpc
-    # Tempel catalogue uses z (redshift) — convert to comoving distance
-    df['dist_mpc'] = df[z_col] * (3e5 / HUBBLE_CONSTANT)
-
-    coords = SkyCoord(
-        ra=df[ra_col].values * u.deg,
-        dec=df[dec_col].values * u.deg,
-        distance=df['dist_mpc'].values * u.Mpc,
-        frame='icrs'
+    # Vectorised polyline -> segment pairs: pair each row with the next, then drop
+    # pairs that straddle a filament boundary. A per-row Python loop over 275k rows
+    # is needlessly slow here.
+    cur = df[["ID", "x", "y", "z"]].to_numpy()
+    nxt = cur[1:]
+    cur = cur[:-1]
+    same = cur[:, 0] == nxt[:, 0]
+    seg = pd.DataFrame(
+        {
+            "x1": cur[same, 1], "y1": cur[same, 2], "z1": cur[same, 3],
+            "x2": nxt[same, 1], "y2": nxt[same, 2], "z2": nxt[same, 3],
+        }
     )
-    df['x'] = coords.cartesian.x.to(u.Mpc).value * 1e6
-    df['y'] = coords.cartesian.y.to(u.Mpc).value * 1e6
-    df['z_coord'] = coords.cartesian.z.to(u.Mpc).value * 1e6
-
-    if fil_col: df['fil_id'] = df[fil_col]
-    if seg_col: df['seg_id'] = df[seg_col]
-
-    # Build segment pairs: consecutive spine points within same filament
-    # Each filament is a polyline — connect point i to point i+1 within same Fil ID
-    segments = []
-    if fil_col and seg_col:
-        df_sorted = df.sort_values([fil_col, seg_col])
-        prev = None
-        for _, row in df_sorted.iterrows():
-            if prev is not None and row[fil_col] == prev[fil_col]:
-                # Same filament — connect consecutive spine points
-                segments.append({
-                    'x1': prev['x'],   'y1': prev['y'],   'z1': prev['z_coord'],
-                    'x2': row['x'],    'y2': row['y'],    'z2': row['z_coord'],
-                })
-            prev = row
-    else:
-        # No fil ID — just pair consecutive rows
-        rows = df[['x','y','z_coord']].values
-        for i in range(0, len(rows)-1, 2):
-            segments.append({
-                'x1':rows[i,0],'y1':rows[i,1],'z1':rows[i,2],
-                'x2':rows[i+1,0],'y2':rows[i+1,1],'z2':rows[i+1,2],
-            })
-
-    seg_df = pd.DataFrame(segments)
-    print(f"  Filament segments: {len(seg_df):,}")
-    return seg_df
+    print(f"  Filament segments: {len(seg):,}")
+    return seg
 
 
 # ── RUN & SAVE ─────────────────────────────────────────────────────────────────

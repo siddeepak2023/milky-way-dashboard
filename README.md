@@ -13,9 +13,23 @@ A real-time interactive 3D visualisation of the observable universe, built entir
 | Galaxies | 2MRS / HyperLEDA | 43,507 |
 | Quasars | SDSS DR17 spectroscopic | 300,000 |
 | Exoplanets | NASA Exoplanet Archive | 6,411 |
+| Cosmic web | Tempel et al. 2014, MNRAS 438, 3465 (Bisous, SDSS) | 260,178 segments |
 
-849,918 points total. The pipeline can also fetch Tempel et al. 2014 (Bisous SDSS)
-filaments, but **the viewer does not render them yet** — see the plan.
+849,918 points across the four point layers, plus the cosmic web as 260,178 line
+segments — 275,599 filament spine points across 15,421 filaments, drawn as polylines.
+
+The web is the one layer whose coordinates need no conversion: that catalogue publishes
+co-moving Cartesian x/y/z in Mpc/h directly, so unlike every point layer there is no
+RA/Dec projection and no redshift-to-distance step. Only h is assumed, taken as
+H₀/100 = 0.7.
+
+Two honest caveats about it. Its overall flattened shape is the **SDSS survey footprint**,
+not a property of the universe — SDSS covers a wedge of sky, so the web stops where the
+survey stops. And it is normalised onto its own shell by the same per-layer transform
+every other layer gets, so it is **not spatially registered against the galaxy layer**:
+the galaxies shown are 2MRS, the filaments were found in SDSS, and a galaxy appearing
+near a strand is coincidence, not correspondence. The catalogue does ship the actual
+member galaxies per filament (`table3`), which is what a true overlay would need.
 
 ### What the colours mean
 

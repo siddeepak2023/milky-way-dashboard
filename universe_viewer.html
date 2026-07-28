@@ -90,9 +90,10 @@
     <div class="layer" data-k="galaxies"><span class="swatch" style="color:#cf7bff"></span><span class="nm">Galaxies</span><span class="ct" id="ct-galaxies">—</span></div>
     <div class="layer" data-k="quasars"><span class="swatch" style="color:#ff5ec4"></span><span class="nm">Quasars</span><span class="ct" id="ct-quasars">—</span></div>
     <div class="layer" data-k="exo"><span class="swatch" style="color:#00dbb5"></span><span class="nm">Exoplanets</span><span class="ct" id="ct-exo">—</span></div>
+    <div class="layer" data-k="filaments" title="Tempel et al. 2014 (MNRAS 438, 3465) — SDSS filament spines found with the Bisous process. Segments, not objects."><span class="swatch" style="color:#7fb2ff"></span><span class="nm">Cosmic web</span><span class="ct" id="ct-filaments">—</span></div>
     <div class="div"></div>
     <div class="sld"><label>Glow <b id="v-bloom">0.55</b></label><input type="range" id="s-bloom" min="0" max="2.5" step="0.05" value="0.55"></div>
-    <div class="sld"><label>Star size <b id="v-size">1.0</b></label><input type="range" id="s-size" min="0.3" max="2.5" step="0.05" value="1.0"></div>
+    <div class="sld"><label>Point size <b id="v-size">1.0</b></label><input type="range" id="s-size" min="0.3" max="2.5" step="0.05" value="1.0"></div>
     <div class="sld"><label>Drift <b id="v-rot">0.6</b></label><input type="range" id="s-rot" min="0" max="3" step="0.1" value="0.6"></div>
     <div class="div"></div>
     <div class="layer" id="palToggle" title="Vivid spreads real values across a wider hue ramp. True colour is the calibrated appearance.">
@@ -285,6 +286,85 @@ function normalizeOctree(O,target){
   }
 }
 
+// ── cosmic web: CSMF line list ─────────────────────────────────────────
+// Written by pack_filaments.py from Tempel et al. (2014), MNRAS 438, 3465 — SDSS
+// filament spines from the Bisous process. This is a line list, not a point cloud,
+// so it does not use the CSM3 octree: 260,178 segments at 12 B each is 3.0 MB and
+// draws in one call, which is cheaper than any culling scheme would be.
+//   header  32 B : "CSMF" | u32 version,segCount | f32 bmin[3], edge
+//   segment 12 B : u16 x1,y1,z1,x2,y2,z2  (one global cube, isotropic step)
+async function loadFilaments(url,onP){
+  const res=await fetch(url);
+  if(!res.ok) throw new Error(url+': HTTP '+res.status);
+  const total=+res.headers.get('content-length')||0;
+  const reader=res.body.getReader(); const chunks=[]; let got=0;
+  for(;;){ const {done,value}=await reader.read(); if(done)break; chunks.push(value); got+=value.length; if(total&&onP)onP(got/total); }
+  let len=0; for(const c of chunks) len+=c.length;
+  const bytes=new Uint8Array(len); let off=0; for(const c of chunks){ bytes.set(c,off); off+=c.length; }
+
+  if(!(len>32 && bytes[0]===0x43&&bytes[1]===0x53&&bytes[2]===0x4d&&bytes[3]===0x46)) throw new Error(url+': not a CSMF file');
+  const dv=new DataView(bytes.buffer);
+  const version=dv.getUint32(4,true), segCount=dv.getUint32(8,true);
+  if(version!==1) throw new Error(url+': unsupported CSMF version '+version);
+  const bx=dv.getFloat32(12,true), by=dv.getFloat32(16,true), bz=dv.getFloat32(20,true);
+  const edge=dv.getFloat32(24,true), e=edge/65535;
+
+  // two endpoints per segment → LineSegments wants them consecutive
+  const q=new Uint16Array(bytes.buffer,28,segCount*6);
+  const pos=new Float32Array(segCount*6);
+  for(let i=0;i<segCount;i++){
+    const o=i*6;
+    pos[o  ]=bx+q[o  ]*e; pos[o+1]=by+q[o+1]*e; pos[o+2]=bz+q[o+2]*e;
+    pos[o+3]=bx+q[o+3]*e; pos[o+4]=by+q[o+4]*e; pos[o+5]=bz+q[o+5]*e;
+  }
+  return {pos,segCount,n:segCount*2,bytes:len};
+}
+
+// Same centroid-and-98th-percentile transform the point layers get, so the web
+// sits on the shared camera scale. Percentile is over endpoints.
+function normalizeFilaments(F,target){
+  const p=F.pos, n=F.n; if(n<1) return;
+  let cx=0,cy=0,cz=0;
+  for(let i=0;i<n;i++){cx+=p[i*3];cy+=p[i*3+1];cz+=p[i*3+2];}
+  cx/=n;cy/=n;cz/=n;
+  const r=new Float32Array(n);
+  for(let i=0;i<n;i++){const x=p[i*3]-cx,y=p[i*3+1]-cy,z=p[i*3+2]-cz; r[i]=Math.hypot(x,y,z);}
+  const sorted=Array.from(r).sort((a,b)=>a-b);
+  let pc=sorted[Math.floor(0.98*(n-1))]||1; if(pc<=0)pc=1;
+  const s=target/pc;
+  for(let i=0;i<n;i++){ p[i*3]=(p[i*3]-cx)*s; p[i*3+1]=(p[i*3+1]-cy)*s; p[i*3+2]=(p[i*3+2]-cz)*s; }
+}
+
+// Additive lines with distance extinction. gl.LINES ignores linewidth on every
+// desktop GL driver, so depth is carried by opacity rather than thickness.
+const filVert=`
+  uniform float uFade;
+  varying float vF;
+  void main(){
+    vec4 mv=modelViewMatrix*vec4(position,1.0);
+    vF=exp(-max(-mv.z,0.0)*uFade);      // nearer = brighter
+    gl_Position=projectionMatrix*mv;
+  }`;
+const filFrag=`
+  precision mediump float;
+  uniform vec3 uColor; uniform float uOpacity;
+  varying float vF;
+  void main(){ gl_FragColor=vec4(uColor*vF, vF*uOpacity); }`;
+
+function makeFilamentLayer(F,cfg){
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(F.pos,3));
+  const m=new THREE.ShaderMaterial({
+    uniforms:{uColor:{value:new THREE.Color(cfg.color)},uOpacity:{value:cfg.opacity},uFade:{value:cfg.fade}},
+    vertexShader:filVert,fragmentShader:filFrag,
+    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending
+  });
+  const lines=new THREE.LineSegments(g,m);
+  lines.frustumCulled=false;
+  scene.add(lines);
+  return lines;
+}
+
 // Ballesteros (2012) colour-index → effective temperature. Derived for B−V;
 // Gaia's BP−RP tracks it closely enough for colour, not for astrophysics.
 function teffFromBpRp(bp_rp){
@@ -361,8 +441,9 @@ function colorize(n,rad,val,kind,mode){
   return {col:c,bright:b};
 }
 
-const layers={};                    // k → THREE.Group of per-node Points
+const layers={};                    // k → THREE.Group of per-node Points, or LineSegments
 const octrees={};                   // k → {nodes,pos,rad,val,n,col,...}
+let filaments=null;                 // CSMF line list; not an octree, so LOD skips it
 const counts={};
 let paletteMode='vivid';
 function fmt(n){return n.toLocaleString();}
@@ -528,8 +609,30 @@ async function boot(){
     document.getElementById('ct-'+f.k).textContent=fmt(O.n);
     setProg(f.p[1]);
   }
+  // The cosmic web loads last: it is the only layer the viewer can do without, and
+  // a failure here must not stop the point layers from being interactive.
+  // Its shell target sits just inside the galaxy shell so the web reads as
+  // large-scale structure rather than as a foreground cage.
+  try{
+    setProg(0.99,'Loading cosmic web…');
+    const F=await loadFilaments('filaments.bin');
+    normalizeFilaments(F,300);
+    filaments=F;
+    // fade is per scene unit, so it has to be read against the 300-unit shell above:
+    // at a natural viewing distance of ~1100 this leaves ~63% transmission. The first
+    // value tried, 0.0016, left 16% and made the whole web nearly invisible from
+    // outside — measured, not guessed.
+    layers.filaments=makeFilamentLayer(F,{color:0x7fb2ff,opacity:0.8,fade:0.0004});
+    counts.filaments=F.segCount;
+    document.getElementById('ct-filaments').textContent=fmt(F.segCount);
+    totalBytes+=F.bytes;
+    console.log('cosmic web: '+fmt(F.segCount)+' segments, '+(F.bytes/1048576).toFixed(2)+' MB of CSMF');
+  }catch(e){
+    console.error(e);
+    document.getElementById('ct-filaments').textContent='failed';
+  }
   document.getElementById('total').textContent=fmt(totalN);
-  console.log('loaded '+fmt(totalN)+' points, '+(totalBytes/1048576).toFixed(2)+' MB of CSM3 across '
+  console.log('loaded '+fmt(totalN)+' points, '+(totalBytes/1048576).toFixed(2)+' MB across '
     +Object.values(octrees).reduce((a,O)=>a+O.nodes.length,0)+' octree nodes');
   setProg(1,'Ready');
   // fade out loader
@@ -615,6 +718,7 @@ addEventListener('resize',()=>{
 // Debug hook for performance work: lets a console session add synthetic layers and
 // measure the real point-count ceiling on this GPU instead of guessing.
 window.__cosmos={THREE,scene,renderer,composer,camera,controls,layers,octrees,counts,applyPalette,
+  fil:()=>filaments,
   updateLOD,lod:()=>lodStats,
   budget:v=>{ if(v!=null) POINT_BUDGET=v; return POINT_BUDGET; },
   minPx:v=>{ if(v!=null) MIN_PX=v; return MIN_PX; }};
