@@ -26,8 +26,12 @@ STRIDE = 5  # x, y, z, size, value
 JOBS = [
     # (csv, bin, column holding the real scalar)
     ("gaia_points.csv",       "stars.bin",    "bp_rp"),
+    ("gaia_points_lite.csv",  "stars_lite.bin", "bp_rp"),   # phone build, see make_mobile_stars.py
     ("quasars_points.csv",    "quasars.bin",  "redshift"),
     ("galaxies_points.csv",   "galaxies.bin", "redshift"),
+    # SDSS DR17 spectroscopic galaxies — a separate, deeper catalogue to the
+    # HyperLEDA layer above, kept as its own file so neither can clobber the other.
+    ("galaxies_all_points.csv", "galaxies_all.bin", "redshift"),   # merged nearby + SDSS deep
     ("exoplanets_points.csv", "exo.bin",      None),
 ]
 

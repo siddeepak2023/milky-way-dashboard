@@ -67,8 +67,10 @@ HEADER_BYTES = 32
 JOBS = [
     # (source .bin, destination .bin)
     ("stars.bin", "stars_o.bin"),
+    ("stars_lite.bin", "stars_lite_o.bin"),
     ("quasars.bin", "quasars_o.bin"),
     ("galaxies.bin", "galaxies_o.bin"),
+    ("galaxies_all.bin", "galaxies_all_o.bin"),
     ("exo.bin", "exo_o.bin"),
 ]
 

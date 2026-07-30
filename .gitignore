@@ -6,3 +6,26 @@ __pycache__/
 .DS_Store
 stress_*.bin
 _bench_*.html
+
+# The v2 intermediate for the deep field. Only galaxies_sdss_o.bin (the octree) is
+# read by the viewer; this 51MB file is regenerable with to_bin.py from the CSV,
+# which fetch_sdss_galaxies.py regenerates in turn. The older layers keep their
+# intermediates tracked for historical reasons — no need to add 51MB more.
+galaxies_sdss.bin
+
+# Pre-cosmology-fix CSV backups written by fix_comoving_distance.py
+*.preCosmology
+
+gaia_points_lite.csv
+stars_lite.bin
+galaxies_all_points.csv
+galaxies_all.bin
+gaia_points_main.csv
+
+# Source catalogues and packed binaries are regenerable and far past what GitHub will
+# accept — gaia_points_5m.csv alone is 379 MB against a 100 MB hard limit, which is what
+# blocked the push. Rebuild them with fetch_*.py + to_bin.py + pack_octree.py.
+*.csv
+*.bin
+!filaments.bin
+gaia_points.csv.*
