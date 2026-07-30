@@ -152,7 +152,7 @@
       <table>
         <thead><tr><th>Layer</th><th>Count</th><th>How the distance is known</th></tr></thead>
         <tbody>
-          <tr><td class="n">Stars</td><td class="n">6,786,069</td>
+          <tr><td class="n">Stars</td><td class="n">1,200,000 <span style="opacity:.6">&rarr; 6,786,069</span></td>
               <td><b>Gaia DR3</b> parallax — the star's apparent shift as Earth swings around the
               Sun. Every star brighter than <b>G = 13.26</b> whose distance is known to better
               than 10%. Both cuts matter: the magnitude limit is what makes this a complete
@@ -164,8 +164,10 @@
               The remaining 43,507 are a nearby all-sky set whose source file carries no
               provenance header; they have no measured redshift and are drawn neutral.</td></tr>
           <tr><td class="n">Quasars</td><td class="n">752,910</td>
-              <td><b>SDSS DR17</b> spectroscopic redshift. Feeding supermassive black holes — the
-              most distant objects here. Again, all of them.</td></tr>
+              <td><b>SDSS DR17</b> spectroscopic redshift. These are galaxies too — a quasar is the
+              blazing core of one, lit by a feeding supermassive black hole. They get their own layer
+              because they are the most distant objects here, not because they are a different kind of
+              thing. Again, all of them.</td></tr>
           <tr><td class="n">Exoplanets</td><td class="n">6,411</td>
               <td><b>NASA Exoplanet Archive</b>, one point per <em>confirmed planet</em>. Plotted
               at its host star, so multi-planet systems stack on one position.</td></tr>
@@ -187,7 +189,7 @@
               <td class="n">752,910 SDSS quasars under the same cut</td>
               <td><b>100%</b></td></tr>
           <tr><td class="n">Stars</td><td class="n">6,786,069</td>
-              <td class="n">every Gaia DR3 star brighter than G = 13.26 with a distance known to
+              <td class="n">1,200,000 load first; the full set arrives on a fast connection with enough memory. Every Gaia DR3 star brighter than G = 13.26 with a distance known to
               10%, out of ~1.81 billion sources in the release</td>
               <td><b>100%</b></td></tr>
         </tbody>
