@@ -1210,7 +1210,12 @@ async function boot(){
   // hosted), so leaving the upgrade on made a local machine disagree with every
   // visitor AND made the headline flicker between 4,616,289 and 10,202,358 depending
   // on whether the fetch won its race on that reload.
-  if(!LITE && new URLSearchParams(location.search).get('full')==='1') upgradeStars(totalN - counts.stars);
+  // No longer behind ?full=1. The gate existed because the cut of the 6.79M tree drew its
+  // 397,349 points as visible coarse blocks - the cube - and because the published copy had
+  // nowhere to fetch the 52 MB tier from. Compensating exposure by each node's true subtree
+  // ratio fixed the blocks, and the site copy now hosts the binary off-repo. Here the file
+  // sits next to this page, so the relative url already resolves.
+  if(!LITE) upgradeStars(totalN - counts.stars);
   // The headline count has to come from what actually loaded, not from a number typed
   // into the markup. On the lite build the star layer is 1.2M rather than 7.4M, and a
   // hardcoded 10,202,358 would be a claim the page did not deliver — which is exactly
