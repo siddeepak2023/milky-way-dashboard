@@ -813,6 +813,9 @@ const _sph=new THREE.Sphere(), _camLocal=new THREE.Vector3();
 // cosmic web read as the whole map. Slow GPUs step down at runtime, one-way.
 const BUDGET_FLOOR=900_000;
 let slowWins=0, ctlFrames=0, ctlAcc=0;
+// Owned by the POINT SIZE slider, read by updateFades — the only place allowed to write
+// uSize. A slider writing the uniform directly loses the race with the per-frame write.
+let SIZE_MUL=1;
 let POINT_BUDGET=CAPTURE?3_000_000:1_800_000;
 // Share of the frame budget each visible layer is guaranteed before the open contest.
 // Four contested layers x 0.14 = 56% reserved, leaving 44% allocated purely by screen size.
@@ -1068,7 +1071,9 @@ function updateFades(dtMs){
         // glowing cube around the star sphere. Glow is bloom's job now (threshold 0.16),
         // and bloom works on pixels, so it cannot inherit the node grid.
         nd.pts.material.uniforms.uExposure.value = nd.expBase0*compE*nd.fade*nearDamp(k,camD);
-        nd.pts.material.uniforms.uSize.value     = nd.sizeBase0*compS;
+        // SIZE_MUL, or the POINT SIZE slider does nothing: this runs for every drawn node
+        // every frame and overwrote whatever the slider had just written.
+        nd.pts.material.uniforms.uSize.value     = nd.sizeBase0*compS*SIZE_MUL;
       }
       nd.want=0;
     }
@@ -1270,7 +1275,9 @@ sB.oninput=()=>{ const v=+sB.value;
   document.getElementById('v-bloom').textContent=sB.value; };
 sS.oninput=()=>{document.getElementById('v-size').textContent=sS.value;
   const v=+sS.value;
-  Object.values(layers).forEach(g=>{ if(g) g.children.forEach(p=>{ p.material.uniforms.uSize.value=v*p.userData.sizeMul; }); });};
+  // Through SIZE_MUL, so the setting survives the next frame and applies to nodes that
+  // fade in later rather than only to whatever was on screen when the slider moved.
+  SIZE_MUL=+sS.value;};
 sR.oninput=()=>{document.getElementById('v-rot').textContent=sR.value;};
 
 // camera tweening
@@ -1540,10 +1547,16 @@ addEventListener('blur',endStuckDrag);
 // Drift keeps rotating the scene after you let go, which makes a released drag look
 // like it is still running. Hold it for a moment after any input so "did it stop?"
 // has an unambiguous answer.
-let _lastInput=0;
-['pointerdown','pointerup','pointermove','wheel'].forEach(ev=>
-  addEventListener(ev,()=>{ _lastInput=performance.now(); },{passive:true}));
-function driftHeld(){ return performance.now()-_lastInput < 1500; }
+// pointermove is NOT input. It used to be, and that one entry is why the map looked frozen:
+// any cursor movement over the window refreshed the hold, so drift was suppressed the whole
+// time anyone used the panel and for 1.5s after every twitch — which also made the DRIFT
+// slider look dead. A held drag still must suppress drift, so track the drag explicitly.
+let _lastInput=0, _dragging=false;
+addEventListener('pointerdown',()=>{ _dragging=true;  _lastInput=performance.now(); },{passive:true});
+['pointerup','pointercancel'].forEach(ev=>
+  addEventListener(ev,()=>{ _dragging=false; _lastInput=performance.now(); },{passive:true}));
+addEventListener('wheel',()=>{ _lastInput=performance.now(); },{passive:true});
+function driftHeld(){ return _dragging || performance.now()-_lastInput < 1500; }
 
 // ── render loop ────────────────────────────────────────────────────────
 const ease=t=>t<0.5?4*t*t*t:1-Math.pow(-2*t+2,3)/2;
